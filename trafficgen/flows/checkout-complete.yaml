@@ -1,0 +1,9 @@
+type: scripted
+name: "checkout-complete"
+steps:
+  - action: open_random_category
+  - action: open_random_pdp
+  - action: add_to_cart
+  - action: view_cart
+  - action: start_checkout
+  - action: maybe_complete_checkout

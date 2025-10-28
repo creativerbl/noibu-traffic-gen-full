@@ -1,0 +1,44 @@
+type: markov
+name: "account-create-and-browse"
+start: "home"
+max_steps: 8
+states:
+  home:
+    actions: []
+    transitions:
+      - to: cat
+        weight: 3
+      - to: content
+        weight: 1
+  cat:
+    actions:
+      - { action: open_random_category }
+      - { action: sort_or_filter }
+    transitions:
+      - to: pdp
+        weight: 3
+      - to: END
+        weight: 1
+  pdp:
+    actions:
+      - { action: open_random_pdp, count: 2 }
+    transitions:
+      - to: checkout
+        weight: 1
+      - to: END
+        weight: 2
+  checkout:
+    actions:
+      - { action: add_to_cart }
+      - { action: view_cart }
+      - { action: start_checkout }
+      - { action: maybe_complete_checkout }
+    transitions:
+      - to: END
+        weight: 1
+  content:
+    actions:
+      - { action: content_page, slug: "/contact-us/" }
+    transitions:
+      - to: END
+        weight: 1

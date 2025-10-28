@@ -1,0 +1,6 @@
+type: scripted
+name: "content-read"
+steps:
+  - { action: content_page, slug: "/shipping-returns/" }
+  - { action: content_page, slug: "/blog/" }
+  - { action: content_page, slug: "/contact-us/" }
