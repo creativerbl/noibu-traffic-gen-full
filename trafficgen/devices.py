@@ -1,78 +1,76 @@
+
 from dataclasses import dataclass
-from typing import List, Dict, Any
 import random
 
 @dataclass
-class DevicePreset:
+class DeviceChoice:
     name: str
-    pw_name: str  # Playwright builtin name
-    weight: float
+    pw_name: str | None
 
-# mapping of our friendly names to Playwright device descriptors
+# Mapping of friendly names to Playwright descriptors or custom (None)
 DEVICE_MAP = {
-    "iphone-14": "iPhone 14",
-    "android-pixel": "Pixel 7",
-    "ipad": "iPad (gen 7)",
-    "desktop-chrome": None,   # custom
-    "desktop-edge": None,     # custom
+    "iphone-safari": "iPhone 14",
+    "iphone-chrome": "iPhone 14",  # will override UA to Chrome-on-iOS
+    "android-chrome": "Pixel 7",
+    "desktop-chrome": None,
+    "desktop-edge": None,
+    "desktop-safari": None,
+    "desktop-firefox": None,
 }
 
-DEFAULTS = [
-    DevicePreset("iphone-14", "iPhone 14", 0.30),
-    DevicePreset("android-pixel", "Pixel 7", 0.20),
-    DevicePreset("ipad", "iPad (gen 7)", 0.10),
-    DevicePreset("desktop-chrome", None, 0.25),
-    DevicePreset("desktop-edge", None, 0.15),
-]
-
-def build_device_pool(config_mix: List[dict]) -> List[DevicePreset]:
-    if not config_mix:
-        return DEFAULTS
-    pool: List[DevicePreset] = []
-    for item in config_mix:
-        nm = item.get("name")
-        wt = float(item.get("weight", 1.0))
-        pw_name = DEVICE_MAP.get(nm)
-        if nm:
-            pool.append(DevicePreset(nm, pw_name, wt))
+def build_device_pool(device_mix):
+    pool = []
+    for item in device_mix:
+        name = item.get("name")
+        weight = float(item.get("weight", 1.0))
+        if name not in DEVICE_MAP:
+            continue
+        for _ in range(int(weight)):
+            pool.append(DeviceChoice(name=name, pw_name=DEVICE_MAP[name]))
     return pool
 
-def pick_device(pool: List[DevicePreset], playwright) -> Dict[str, Any]:
-    total_w = sum(max(d.weight, 0.0) for d in pool) or 1.0
-    r = random.uniform(0, total_w)
-    acc = 0.0
-    chosen = pool[-1]
-    for d in pool:
-        acc += max(d.weight, 0.0)
-        if r <= acc:
-            chosen = d
-            break
-
-    # Start from PW builtin descriptor if present
+def pick_device(pool, playwright):
+    chosen = random.choice(pool)
     context_args = {}
+    # Apply builtin descriptor if present
     if chosen.pw_name:
         context_args.update(playwright.devices.get(chosen.pw_name, {}))
+        if chosen.name == "iphone-chrome":
+            context_args["user_agent"] = (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                "CriOS/120.0.0.0 Mobile/15E148 Safari/604.1"
+            )
     else:
-        # desktop presets
+        # desktop UA overrides
         if chosen.name == "desktop-chrome":
             context_args.update({
                 "viewport": {"width": 1366, "height": 864},
                 "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                               "(KHTML, like Gecko) Chrome/122 Safari/537.36",
-                "device_scale_factor": 1.0,
                 "is_mobile": False,
-                "has_touch": False
             })
         elif chosen.name == "desktop-edge":
             context_args.update({
                 "viewport": {"width": 1440, "height": 900},
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                              "(KHTML, like Gecko) Chrome/120 Safari/537.36 Edg/120",
-                "device_scale_factor": 1.0,
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120 Safari/537.36 Edg/120",
                 "is_mobile": False,
-                "has_touch": False
             })
-        else:
-            context_args.update({"viewport": {"width": 1280, "height": 800}})
-
-    return {"preset": chosen, "context_args": context_args}
+        elif chosen.name == "desktop-safari":
+            context_args.update({
+                "viewport": {"width": 1440, "height": 900},
+                "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                              "Version/17.0 Safari/605.1.15",
+                "is_mobile": False,
+            })
+        elif chosen.name == "desktop-firefox":
+            context_args.update({
+                "viewport": {"width": 1366, "height": 864},
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) "
+                              "Gecko/20100101 Firefox/120.0",
+                "is_mobile": False,
+            })
+    return {"context_args": context_args}
