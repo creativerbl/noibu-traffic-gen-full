@@ -11,29 +11,45 @@ ALLOW_NAV_TIMEOUT = 20000
 SEL_TIMEOUT = 15000
 
 def _slug_from_source(src: str) -> str:
-    """
-    Convert a source like 'https://www.google.com' or 'google' into a clean slug 'google'.
-    """
+    """Convert a source like 'https://www.google.com' or 'google' into a clean slug 'google'."""
     if not src:
         return ""
     s = src.strip().lower()
     if s == "direct":
         return "direct"
-    # If it's a URL, take netloc and strip common prefixes
     try:
         if "://" in s:
             netloc = urlparse(s).netloc
         else:
-            # treat as domain or word
             netloc = s
         netloc = re.sub(r"^www\.", "", netloc)
-        # take root label (e.g., google from google.com)
         parts = netloc.split(".")
         if len(parts) >= 2:
             return parts[-2]
         return netloc
     except Exception:
         return re.sub(r"\W+", "", s)
+
+def _parse_kv_csv(env_val: str) -> Dict[str, str]:
+    """
+    Parse 'google:organic,bing:cpc' -> {'google': 'organic', 'bing': 'cpc'}
+    Keys are normalized to slugs using _slug_from_source.
+    """
+    result: Dict[str, str] = {}
+    s = (env_val or "").strip()
+    if not s:
+        return result
+    for pair in s.split(","):
+        if not pair.strip():
+            continue
+        if ":" not in pair:
+            continue
+        k, v = pair.split(":", 1)
+        k = _slug_from_source(k.strip())
+        v = v.strip()
+        if k:
+            result[k] = v
+    return result
 
 class Session:
     def __init__(self,
@@ -68,10 +84,16 @@ class Session:
         self.global_qps = global_qps
         self.debug = debug
         self.fault_profile = fault_profile or {}
-        # NEW: per-session referrer *source* (string like 'direct' or url); used for UTM
+        # per-session referrer *source* (string like 'direct' or url); used for UTM
         self.referrer_url = (referrer_url or "").strip() or None
         if self.referrer_url and self.referrer_url.lower() == "direct":
             self.referrer_url = "direct"
+
+        # UTM override maps (env-driven)
+        self.utm_medium_default = os.getenv("UTM_MEDIUM_DEFAULT", "organic")
+        self.utm_campaign_default = os.getenv("UTM_CAMPAIGN_DEFAULT", "trafficgen")
+        self.utm_mediums = _parse_kv_csv(os.getenv("REFERRER_UTM_MEDIUMS", ""))
+        self.utm_campaigns = _parse_kv_csv(os.getenv("REFERRER_UTM_CAMPAIGNS", ""))
 
         self.page = None
         self.context = None
@@ -179,7 +201,6 @@ class Session:
             for step in s.get("actions", []):
                 await self._execute_step(step)
                 await think(self.think_cfg["page_min_ms"], self.think_cfg["page_max_ms"])
-            # choose next
             trans = s.get("transitions", [])
             if not trans:
                 break
@@ -200,22 +221,21 @@ class Session:
 
     async def _landing(self):
         """
-        Landing now supports UTM-based source attribution.
-        If referrer source is not 'direct', append utm_source (& optional medium/campaign)
+        Landing supports UTM-based source attribution.
+        If referrer source is not 'direct', append utm_source (& optional medium/campaign overrides)
         to the very first landing URL so analytics can classify it.
         """
-        utm_medium_default = os.getenv("UTM_MEDIUM_DEFAULT", "organic")
-        utm_campaign_default = os.getenv("UTM_CAMPAIGN_DEFAULT", "trafficgen")
-
         # Build landing URL
         landing = self.origin + "/"
         if self.referrer_url and self.referrer_url != "direct":
             utm_source = _slug_from_source(self.referrer_url)
             if utm_source and utm_source != "direct":
+                utm_medium = self.utm_mediums.get(utm_source, self.utm_medium_default)
+                utm_campaign = self.utm_campaigns.get(utm_source, self.utm_campaign_default)
                 q = {
                     "utm_source": utm_source,
-                    "utm_medium": utm_medium_default,
-                    "utm_campaign": utm_campaign_default,
+                    "utm_medium": utm_medium,
+                    "utm_campaign": utm_campaign,
                 }
                 sep = "?" if "?" not in landing else "&"
                 landing = landing + sep + urlencode(q)
