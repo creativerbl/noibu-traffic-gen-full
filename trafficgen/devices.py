@@ -1,16 +1,16 @@
 
 from dataclasses import dataclass
 import random
+from typing import Optional
 
 @dataclass
 class DeviceChoice:
     name: str
-    pw_name: str | None
+    pw_name: Optional[str]
 
-# Mapping of friendly names to Playwright descriptors or custom (None)
 DEVICE_MAP = {
     "iphone-safari": "iPhone 14",
-    "iphone-chrome": "iPhone 14",  # will override UA to Chrome-on-iOS
+    "iphone-chrome": "iPhone 14",
     "android-chrome": "Pixel 7",
     "desktop-chrome": None,
     "desktop-edge": None,
@@ -22,17 +22,18 @@ def build_device_pool(device_mix):
     pool = []
     for item in device_mix:
         name = item.get("name")
-        weight = float(item.get("weight", 1.0))
-        if name not in DEVICE_MAP:
+        weight = max(float(item.get("weight", 1.0)), 0.0)
+        if name not in DEVICE_MAP or weight <= 0:
             continue
         for _ in range(int(weight)):
             pool.append(DeviceChoice(name=name, pw_name=DEVICE_MAP[name]))
+    if not pool:
+        pool.append(DeviceChoice(name="desktop-chrome", pw_name=None))
     return pool
 
 def pick_device(pool, playwright):
     chosen = random.choice(pool)
     context_args = {}
-    # Apply builtin descriptor if present
     if chosen.pw_name:
         context_args.update(playwright.devices.get(chosen.pw_name, {}))
         if chosen.name == "iphone-chrome":
@@ -42,13 +43,14 @@ def pick_device(pool, playwright):
                 "CriOS/120.0.0.0 Mobile/15E148 Safari/604.1"
             )
     else:
-        # desktop UA overrides
         if chosen.name == "desktop-chrome":
             context_args.update({
                 "viewport": {"width": 1366, "height": 864},
                 "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                               "(KHTML, like Gecko) Chrome/122 Safari/537.36",
                 "is_mobile": False,
+                "has_touch": False,
+                "device_scale_factor": 1.0,
             })
         elif chosen.name == "desktop-edge":
             context_args.update({
@@ -57,6 +59,8 @@ def pick_device(pool, playwright):
                               "AppleWebKit/537.36 (KHTML, like Gecko) "
                               "Chrome/120 Safari/537.36 Edg/120",
                 "is_mobile": False,
+                "has_touch": False,
+                "device_scale_factor": 1.0,
             })
         elif chosen.name == "desktop-safari":
             context_args.update({
@@ -65,6 +69,8 @@ def pick_device(pool, playwright):
                               "AppleWebKit/605.1.15 (KHTML, like Gecko) "
                               "Version/17.0 Safari/605.1.15",
                 "is_mobile": False,
+                "has_touch": False,
+                "device_scale_factor": 2.0,
             })
         elif chosen.name == "desktop-firefox":
             context_args.update({
@@ -72,5 +78,9 @@ def pick_device(pool, playwright):
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) "
                               "Gecko/20100101 Firefox/120.0",
                 "is_mobile": False,
+                "has_touch": False,
+                "device_scale_factor": 1.0,
             })
+        else:
+            context_args.update({"viewport": {"width": 1280, "height": 800}})
     return {"context_args": context_args}

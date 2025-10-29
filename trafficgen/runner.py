@@ -1,8 +1,10 @@
+
 import asyncio
 import signal
 import random
 import contextlib
-import os  
+import os
+import math
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 
@@ -22,7 +24,6 @@ class RunnerConfig:
     global_qps_cap: float
     checkout_complete_rate: float
     allow_checkout: bool
-    kill_switch_file: Optional[str]
     device_mix: List[dict]
     locales: List[str]
     timezones: List[str]
@@ -30,35 +31,14 @@ class RunnerConfig:
     think_times: Dict[str, int]
     smoke: bool = False
     debug: bool = False
+    kill_switch_file: Optional[str] = None
     referrers: Optional[List[Dict[str, Any]]] = None
-
-    @staticmethod
-    def from_dict(d: dict, flows: List[dict], debug: bool = False) -> "RunnerConfig":
-        site = d.get("site", {})
-        t = d.get("traffic", {})
-        return RunnerConfig(
-            origin=site.get("origin", "https://noibu.mybigcommerce.com"),
-            allowlist_roots=site.get("allowlist_roots", ["https://noibu.mybigcommerce.com"]),
-            sessions_per_minute=float(t.get("sessions_per_minute", 25)),
-            avg_session_minutes=float(t.get("avg_session_minutes", 3)),
-            max_concurrency=int(t.get("max_concurrency", 100)),
-            global_qps_cap=float(t.get("global_qps_cap", 6)),
-            checkout_complete_rate=float(t.get("checkout_complete_rate", 0.3)),
-            allow_checkout=bool(t.get("allow_checkout", True)),
-            kill_switch_file=t.get("kill_switch_file"),
-            device_mix=d.get("devices", {}).get("mix", []),
-            locales=d.get("locales", ["en-US"]),
-            timezones=d.get("timezones", ["America/Toronto"]),
-            flows=flows,
-            think_times=d.get("think_times", {"page_min_ms": 800, "page_max_ms": 3000, "scroll_min_ms": 200, "scroll_max_ms": 1000}),
-            debug=debug,
-            referrers=d.get("referrers"),
-        )
 
 def _weighted_pick(items: List[Dict[str, Any]], key: str = "weight") -> Optional[Dict[str, Any]]:
     if not items:
         return None
-    weights, total = [], 0.0
+    weights = []
+    total = 0.0
     for it in items:
         try:
             w = float(it.get(key, 0) or 0)
@@ -66,7 +46,8 @@ def _weighted_pick(items: List[Dict[str, Any]], key: str = "weight") -> Optional
             w = 0.0
         if w < 0:
             w = 0.0
-        weights.append(w); total += w
+        weights.append(w)
+        total += w
     if total <= 0:
         import random as _r
         return _r.choice(items)
@@ -92,10 +73,11 @@ class Runner:
         for s in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(s, lambda s=s: asyncio.create_task(self._graceful_stop(s)))
 
-        headless = os.getenv("HEADLESS", "true").lower() != "false"
+        headless = True  # Chromium-only; headless by default
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=headless)
             device_pool = build_device_pool(self.cfg.device_mix)
+
             tasks = []
             try:
                 tasks.append(asyncio.create_task(self._schedule_loop(browser, pw, device_pool)))
@@ -111,7 +93,6 @@ class Runner:
         while not self.stop_event.is_set():
             if self.cfg.kill_switch_file:
                 try:
-                    import os
                     if os.path.exists(self.cfg.kill_switch_file):
                         debug_print(self.cfg.debug, "Kill switch present; draining…")
                         break

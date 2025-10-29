@@ -1,3 +1,4 @@
+
 import asyncio
 import os
 import random
@@ -77,14 +78,35 @@ class Session:
         self.global_qps = global_qps
         self.debug = debug
         self.fault_profile = fault_profile or {}
+
+        # Referrer per session
         self.referrer_url = (referrer_url or "").strip() or None
         if self.referrer_url and self.referrer_url.lower() == "direct":
             self.referrer_url = "direct"
 
-        self.utm_medium_default = os.getenv("UTM_MEDIUM_DEFAULT", "organic")
+        # UTM env
+        self.utm_medium_default = os.getenv("UTM_MEDIUM_DEFAULT", "paid-social")
         self.utm_campaign_default = os.getenv("UTM_CAMPAIGN_DEFAULT", "trafficgen")
         self.utm_mediums = _parse_kv_csv(os.getenv("REFERRER_UTM_MEDIUMS", ""))
-        self.utm_campaigns = _parse_kv_csv(os.getenv("REFERRER_UTM_CAMPAIGNS", ""))
+
+        # --- Human-like nav/scroll behavior (all .env driven) ---
+        # Wait strategy after goto: 'load' | 'domcontentloaded' | 'networkidle'
+        self.wait_until = os.getenv("PAGE_WAIT_UNTIL", "load").strip().lower()
+        if self.wait_until not in ("load", "domcontentloaded", "networkidle"):
+            self.wait_until = "load"
+
+        # Random settle delay after navigation (ms)
+        self.post_nav_settle_min = int(os.getenv("POST_NAV_SETTLE_MIN_MS", "250"))
+        self.post_nav_settle_max = int(os.getenv("POST_NAV_SETTLE_MAX_MS", "900"))
+
+        # Probability of scrolling after a pageview (0..1)
+        self.scroll_prob = float(os.getenv("SCROLL_PROB", "0.75"))
+        # Fraction of total page height to scroll to (min..max)
+        self.scroll_depth_min = float(os.getenv("SCROLL_DEPTH_MIN", "0.35"))
+        self.scroll_depth_max = float(os.getenv("SCROLL_DEPTH_MAX", "0.95"))
+        # Number of scroll steps
+        self.scroll_steps_min = int(os.getenv("SCROLL_STEPS_MIN", "2"))
+        self.scroll_steps_max = int(os.getenv("SCROLL_STEPS_MAX", "6"))
 
         self.page = None
         self.context = None
@@ -102,6 +124,7 @@ class Session:
         slow_pct = float(self.fault_profile.get("slow_request_fraction", 0.0))
         if slow_pct <= 0:
             return
+
         async def route_handler(route):
             if random.random() < slow_pct:
                 await asyncio.sleep(random.uniform(0.1, 0.6))
@@ -115,17 +138,30 @@ class Session:
         backoff = ExponentialBackoff()
         while True:
             try:
-                return await self.page.goto(url, timeout=ALLOW_NAV_TIMEOUT, wait_until="domcontentloaded")
+                resp = await self.page.goto(url, timeout=ALLOW_NAV_TIMEOUT, wait_until=self.wait_until)
+                # Small human-like settle pause after navigation
+                settle = random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000)
+                await asyncio.sleep(settle)
+                return resp
             except Exception:
                 await backoff.wait()
                 if backoff.attempts > 5:
                     raise
 
-    async def _scroll_page(self):
+    async def _maybe_scroll_page(self):
+        """Human-like scrolling: sometimes don't scroll; sometimes partial depth."""
+        # decide if we scroll at all
+        if random.random() > max(0.0, min(1.0, self.scroll_prob)):
+            debug_print(self.debug, f"[S{self.id}] no scroll (randomized)")
+            return
+
+        # Ensure <body>
         try:
             await self.page.wait_for_selector("body", timeout=SEL_TIMEOUT)
         except Exception:
-            return
+            return  # if body never appears, skip
+
+        # Estimate page height safely
         try:
             height = await self.page.evaluate("""
                 () => {
@@ -139,12 +175,17 @@ class Session:
                   const h = Math.max( ...vals, 0 );
                   return (h && isFinite(h)) ? h : 2000;
                 }
-            """ )
+            """)
         except Exception:
             height = 2000
-        steps = max(3, min(8, int(height / 800)))
+
+        # Pick a random depth and step count
+        depth_frac = max(0.0, min(1.0, random.uniform(self.scroll_depth_min, self.scroll_depth_max)))
+        target = max(400, height * depth_frac)
+        steps = max(1, min(10, random.randint(self.scroll_steps_min, self.scroll_steps_max)))
+
         for _ in range(steps):
-            await self.page.mouse.wheel(0, height / steps)
+            await self.page.mouse.wheel(0, target/steps)
             await think(self.think_cfg["scroll_min_ms"], self.think_cfg["scroll_max_ms"])
 
     async def _click_by_text(self, text: str, exact: bool = False):
@@ -160,7 +201,7 @@ class Session:
     async def run(self):
         await self._new_context()
         try:
-            flow = random.choice(self.flows or [{}])
+            flow = random.choice(self.flows or [{}])  # YAML doc
             if not flow:
                 return
             await self._run_scripted(flow)
@@ -180,17 +221,17 @@ class Session:
             utm_source = _slug_from_source(self.referrer_url)
             if utm_source and utm_source != "direct":
                 utm_medium = self.utm_mediums.get(utm_source, self.utm_medium_default)
-                utm_campaign = self.utm_campaigns.get(utm_source, self.utm_campaign_default)
+                utm_campaign = self.utm_campaign_default
                 q = {"utm_source": utm_source, "utm_medium": utm_medium, "utm_campaign": utm_campaign}
                 sep = "?" if "?" not in landing else "&"
                 landing = landing + sep + urlencode(q)
                 debug_print(self.debug, f"[S{self.id}] landing with UTM: {landing}")
             else:
-                debug_print(self.debug, f"[S{self.id}] landing direct (no valid source slug)")
+                debug_print(self.debug, f"[S{self.id}] landing direct (invalid source)")
         else:
             debug_print(self.debug, f"[S{self.id}] landing direct")
         await self._guarded_goto(landing)
-        await self._scroll_page()
+        await self._maybe_scroll_page()
 
     async def _execute_step(self, step: dict):
         kind = step.get("action")
@@ -227,7 +268,7 @@ class Session:
             await sf.press("Enter")
         except Exception:
             await self._guarded_goto(f"{self.origin}/search.php?search_query={query}")
-        await self._scroll_page()
+        await self._maybe_scroll_page()
 
     async def _open_random_category(self):
         nav_candidates = self.page.get_by_role("link", name=re.compile("(Shop|All|Men|Women|Accessories|Catalog|Sale|New)", re.I))
@@ -238,7 +279,7 @@ class Session:
         else:
             cand = random.choice(["/all/", "/categories/", "/shop/"])
             await self._guarded_goto(f"{self.origin}{cand}")
-        await self._scroll_page()
+        await self._maybe_scroll_page()
 
     async def _open_random_pdp(self, count: int = 1):
         count = max(1, min(count, 3))
@@ -251,7 +292,7 @@ class Session:
             if n > 0:
                 i = random.randint(0, min(n-1, 15))
                 await grid.nth(i).click(timeout=SEL_TIMEOUT)
-                await self._scroll_page()
+                await self._maybe_scroll_page()
             else:
                 break
 
@@ -261,7 +302,7 @@ class Session:
             await sort_sel.first.select_option(index=random.randint(0, 2), timeout=SEL_TIMEOUT)
         except Exception:
             pass
-        await self._scroll_page()
+        await self._maybe_scroll_page()
 
     async def _add_to_cart(self):
         try:
@@ -280,7 +321,7 @@ class Session:
             await link.first.click(timeout=SEL_TIMEOUT)
         except Exception:
             await self._guarded_goto(f"{self.origin}/cart.php")
-        await self._scroll_page()
+        await self._maybe_scroll_page()
 
     async def _start_checkout(self):
         try:
@@ -291,14 +332,14 @@ class Session:
                 await self.page.click("a[href*='/checkout']", timeout=SEL_TIMEOUT)
             except Exception:
                 return
-        await self._scroll_page()
+        await self._maybe_scroll_page()
 
     async def _content_page(self, slug: str):
         slugs = ["/contact-us/", "/shipping-returns/", "/blog/", "/help/"]
         if slug and slug.startswith("/"):
             slugs.insert(0, slug)
         await self._guarded_goto(self.origin + random.choice(slugs))
-        await self._scroll_page()
+        await self._maybe_scroll_page()
 
     async def _complete_checkout(self):
         card_no = os.getenv("BC_TEST_CARD_NUMBER", "")
