@@ -25,7 +25,8 @@ class Session:
                  think_cfg: Dict[str, int],
                  global_qps,
                  debug: bool = False,
-                 fault_profile: Optional[dict] = None):
+                 fault_profile: Optional[dict] = None,
+                 referrer_url: Optional[str] = None):
         self.id = session_id
         self.browser = browser
         self.playwright = playwright
@@ -41,6 +42,10 @@ class Session:
         self.global_qps = global_qps
         self.debug = debug
         self.fault_profile = fault_profile or {}
+        # NEW: per-session referrer (None or 'direct' => no header)
+        self.referrer_url = (referrer_url or "").strip() or None
+        if self.referrer_url and self.referrer_url.lower() == "direct":
+            self.referrer_url = None
 
         self.page = None
         self.context = None
@@ -50,6 +55,17 @@ class Session:
         cargs["locale"] = self.locale
         cargs["timezone_id"] = self.tz
         cargs.setdefault("ignore_https_errors", True)
+        # Inject Referer header if configured for this session
+        if self.referrer_url:
+            # Normalize: ensure scheme and trailing slash
+            ref = self.referrer_url
+            if not re.match(r'^https?://', ref, re.I):
+                ref = "https://" + ref.lstrip("/")
+            if not ref.endswith("/"):
+                ref = ref + "/"
+            cargs.setdefault("extra_http_headers", {})
+            cargs["extra_http_headers"] = {**cargs["extra_http_headers"], "Referer": ref}
+            debug_print(self.debug, f"[S{self.id}] Using Referer={ref}")
         self.context = await self.browser.new_context(**cargs)
         self.page = await self.context.new_page()
         await self._install_faults()
@@ -109,7 +125,6 @@ class Session:
         for _ in range(steps):
             await self.page.mouse.wheel(0, height / steps)
             await think(self.think_cfg["scroll_min_ms"], self.think_cfg["scroll_max_ms"])
-
 
     async def _click_by_text(self, text: str, exact: bool = False):
         await self.global_qps.wait()

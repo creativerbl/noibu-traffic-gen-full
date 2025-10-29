@@ -20,18 +20,30 @@ AVG_SESSION_MIN  = float(os.getenv("AVG_SESSION_MINUTES", "1"))
 EXTRA_FIXED_WAIT_SEC = float(os.getenv("EXTRA_FIXED_WAIT_SEC", "5"))  # fixed settle after nav/click
 CHECKOUT_COMPLETE_RATE = float(os.getenv("CHECKOUT_COMPLETE_RATE", "0.3"))
 
-# ---------- TEST CARD (BigCommerce test mode ONLY) ----------
-# Public TEST credentials from BigCommerce docs. Never use real cards.
-TEST_CARD_NUMBER_DEFAULT = "4111111111111111"
-TEST_CARD_EXP_DEFAULT    = "12/30"
-TEST_CARD_CVV_DEFAULT    = "123"
-TEST_CARD_NAME_DEFAULT   = "Test User"
+# Referrer envs (comma-separated lists)
+def _parse_csv(s):
+    return [x.strip() for x in (s or "").split(",") if x and x.strip()]
 
-# Preload env with safe defaults if not already set
-os.environ.setdefault("BC_TEST_CARD_NUMBER", TEST_CARD_NUMBER_DEFAULT)
-os.environ.setdefault("BC_TEST_EXP", TEST_CARD_EXP_DEFAULT)
-os.environ.setdefault("BC_TEST_CVV", TEST_CARD_CVV_DEFAULT)
-os.environ.setdefault("BC_TEST_NAME", TEST_CARD_NAME_DEFAULT)
+def build_referrers_from_env():
+    sources = _parse_csv(os.getenv("REFERRER_SOURCES", ""))
+    weights = _parse_csv(os.getenv("REFERRER_WEIGHTS", ""))
+    # Defaults: Direct highest, google, bing, then others
+    if not sources:
+        sources = ["direct", "https://www.google.com", "https://www.bing.com"]
+    if not weights or len(weights) != len(sources):
+        # default weights aligned to the above
+        defaults = [50, 25, 15] + [5] * max(0, len(sources) - 3)
+        weights = [str(w) for w in defaults[:len(sources)]]
+    items = []
+    for s, w in zip(sources, weights):
+        try:
+            wt = float(w)
+        except ValueError:
+            wt = 1.0
+        items.append({"source": s, "weight": wt})
+    return items
+
+REFERRERS = build_referrers_from_env()
 
 def log(*a): print(*a, flush=True)
 
@@ -107,41 +119,29 @@ async def _click_by_text_dom(self, text: str, exact: bool = False):
 Session._click_by_text = _click_by_text_dom
 
 async def _click_role_dom(self, role: str, name: str | None = None, exact: bool = False):
-    log(f"[S{self.id}] CLICK role={role} name={name!r}")
+    log(f"[S{self.id}] CLICK role={role} name={name}")
     loc = self.page.get_by_role(role, name=name, exact=exact) if name else self.page.get_by_role(role)
     await _click_and_wait_dom(self, loc)
 Session._click_role = _click_role_dom
 
-async def _click_selector_dom(self, css: str):
-    log(f"[S{self.id}] CLICK css={css!r}")
-    await _click_and_wait_dom(self, self.page.locator(css))
+async def _click_selector_dom(self, sel: str):
+    log(f"[S{self.id}] CLICK sel={sel}")
+    await _click_and_wait_dom(self, self.page.locator(sel))
 Session._click_selector = _click_selector_dom
 
-# 4) Safe scroll (avoids document.body null)
 async def _scroll_page_logged(self):
+    # Same as base but with log + settle
     try:
         await self.page.wait_for_selector("body", timeout=SEL_TIMEOUT)
     except Exception:
-        log(f"[S{self.id}] SCROLL skip (no body)")
+        log(f"[S{self.id}] SCROLL: body missing")
         return
     try:
-        height = await self.page.evaluate("""
-            () => {
-              const doc = document.documentElement;
-              const body = document.body;
-              const vals = [
-                doc?.scrollHeight, body?.scrollHeight,
-                doc?.offsetHeight, body?.offsetHeight,
-                doc?.clientHeight, body?.clientHeight
-              ].filter(v => typeof v === 'number');
-              const h = Math.max(...vals, 0);
-              return (h && Number.isFinite(h)) ? h : 2000;
-            }
-        """)
+        height = await self.page.evaluate("() => Math.max(document.documentElement.scrollHeight || 0, document.body?.scrollHeight || 0, 2000)")
     except Exception:
         height = 2000
     steps = max(3, min(8, int(height/800)))
-    log(f"[S{self.id}] SCROLL h≈{height} steps={steps}")
+    log(f"[S{self.id}] SCROLL height≈{height} steps={steps}")
     for _ in range(steps):
         try:
             await self.page.mouse.wheel(0, height/steps)
@@ -287,70 +287,8 @@ async def _open_nav_category_weighted(self):
         await self._guarded_goto(ORIGIN + path)
 Session._open_nav_category = _open_nav_category_weighted
 
-# --- PDP open (random tile on grid) ---
-async def _open_random_pdp(self, count: int = 1):
-    import random
-    count = max(1, min(count, 3))
-    for _ in range(count):
-        grid = self.page.locator("a.card-figure, a.card-title, a.product-title, a[href*='/products/']")
-        try:
-            n = await grid.count()
-        except Exception:
-            n = 0
-        if n == 0:
-            log(f"[S{self.id}] PDP grid: none")
-            return
-        i = random.randint(0, min(n-1, 10))  # bias to above-the-fold
-        log(f"[S{self.id}] PDP grid idx={i}/{n}")
-        await _click_and_wait_dom(self, grid.nth(i))
-Session._open_random_pdp = _open_random_pdp
-
-# --- Add to cart / view cart / start checkout ---
-async def _add_to_cart_dom(self):
-    try:
-        btn = self.page.get_by_role("button", name=lambda s: "add to cart" in s.lower())
-        await _click_and_wait_dom(self, btn)
-        log(f"[S{self.id}] ADD TO CART (role)")
-        return
-    except Exception:
-        pass
-    try:
-        await self._click_selector("button#form-action-addToCart, button[name='add']")
-        log(f"[S{self.id}] ADD TO CART (css)")
-    except Exception:
-        log(f"[S{self.id}] ADD TO CART not found")
-Session._add_to_cart = _add_to_cart_dom
-
-async def _view_cart_dom(self):
-    try:
-        await self._click_role("link", name=lambda s: "cart" in s.lower())
-        log(f"[S{self.id}] VIEW CART (role)")
-        return
-    except Exception:
-        await self._guarded_goto(ORIGIN + "/cart.php")
-        log(f"[S{self.id}] VIEW CART (direct)")
-Session._view_cart = _view_cart_dom
-
-async def _start_checkout_dom(self):
-    for loc in [
-        self.page.get_by_role("link",   name=lambda s: "checkout" in s.lower()),
-        self.page.get_by_role("button", name=lambda s: "checkout" in s.lower()),
-    ]:
-        try:
-            await _click_and_wait_dom(self, loc)
-            log(f"[S{self.id}] START CHECKOUT")
-            return
-        except Exception:
-            pass
-    try:
-        await self._click_selector("a[href*='/checkout'], button[href*='/checkout']")
-        log(f"[S{self.id}] START CHECKOUT (css)")
-    except Exception:
-        log(f"[S{self.id}] START CHECKOUT not found")
-Session._start_checkout = _start_checkout_dom
-
 # ============================================================
-# Runner config (Chromium only, loud)
+# Runner config (Chromium only, loud) WITH REFERRERS
 # ============================================================
 cfg = RunnerConfig(
     origin=ORIGIN,
@@ -383,6 +321,7 @@ cfg = RunnerConfig(
     proxy_backend="null", piactl_path="/usr/bin/piactl", pia_regions=[],
     smoke=False,
     debug=True,
+    referrers=REFERRERS,  # NEW
 )
 
 log(f"BOOT: noisy runner @ {SESSIONS_PER_MIN}/min, avg {AVG_SESSION_MIN}min, settle {EXTRA_FIXED_WAIT_SEC}s; origin={ORIGIN}")

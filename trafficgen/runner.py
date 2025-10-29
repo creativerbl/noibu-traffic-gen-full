@@ -10,7 +10,7 @@ from playwright.async_api import async_playwright
 from trafficgen.devices import build_device_pool, pick_device
 from trafficgen.proxy import NullProxyProvider, PIAProxyProvider, ProxyProvider
 from trafficgen.session import Session
-from trafficgen.utils import TokenBucket, debug_print
+from trafficgen.utils import TokenBucket, debug_print, choose_weighted
 
 @dataclass
 class RunnerConfig:
@@ -35,11 +35,14 @@ class RunnerConfig:
     think_times: Dict[str, int]
     smoke: bool = False
     debug: bool = False
+    # NEW: list of {'source': 'direct|https://...', 'weight': float}
+    referrers: Optional[List[Dict[str, Any]]] = None
 
     @staticmethod
     def from_dict(d: dict, flows: List[dict], debug: bool = False) -> "RunnerConfig":
         site = d.get("site", {})
         t = d.get("traffic", {})
+        ref = d.get("referrers", [])
         return RunnerConfig(
             origin=site.get("origin", "https://noibu.mybigcommerce.com"),
             allowlist_roots=site.get("allowlist_roots", ["https://noibu.mybigcommerce.com"]),
@@ -61,6 +64,7 @@ class RunnerConfig:
             pia_regions=d.get("proxy", {}).get("pia_regions", []),
             think_times=d.get("think_times", {"page_min_ms": 800, "page_max_ms": 3000, "scroll_min_ms": 200, "scroll_max_ms": 1000}),
             debug=debug,
+            referrers=ref or None,
         )
 
 class Runner:
@@ -165,12 +169,28 @@ class Runner:
         while self.sem._value < self.cfg.max_concurrency:
             await asyncio.sleep(0.5)
 
+    def _choose_referrer_for_session(self) -> Optional[str]:
+        """
+        Returns either None (for direct) or a URL/domain string.
+        Uses self.cfg.referrers if provided, else None.
+        Expected shape: [{'source': 'direct|https://domain', 'weight': 10}, ...]
+        """
+        items = self.cfg.referrers or []
+        if not items:
+            return None
+        picked = choose_weighted(items, key="weight") or {}
+        src = (picked.get("source") or "").strip()
+        if not src or src.lower() == "direct":
+            return None
+        return src
+
     async def _run_session(self, sid: int, browser, pw, device_pool):
         try:
             dev = pick_device(device_pool, pw)
             import random as _random
             locale = _random.choice(self.cfg.locales or ["en-US"])
             tz = _random.choice(self.cfg.timezones or ["America/Toronto"])
+            ref = self._choose_referrer_for_session()
             s = Session(
                 session_id=sid,
                 browser=browser,
@@ -186,7 +206,8 @@ class Runner:
                 think_cfg=self.cfg.think_times,
                 global_qps=self.global_qps,
                 debug=self.cfg.debug,
-                fault_profile={"slow_request_fraction": 0.03}
+                fault_profile={"slow_request_fraction": 0.03},
+                referrer_url=ref,
             )
             await s.run()
         except Exception as e:
