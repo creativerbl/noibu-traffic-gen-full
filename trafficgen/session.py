@@ -1,3 +1,4 @@
+
 import asyncio
 import os
 import random
@@ -77,14 +78,14 @@ class Session:
         self.global_qps = global_qps
         self.debug = debug
         self.fault_profile = fault_profile or {}
+
         self.referrer_url = (referrer_url or "").strip() or None
         if self.referrer_url and self.referrer_url.lower() == "direct":
             self.referrer_url = "direct"
 
-        self.utm_medium_default = os.getenv("UTM_MEDIUM_DEFAULT", "organic")
+        self.utm_medium_default = os.getenv("UTM_MEDIUM_DEFAULT", "paid-social")
         self.utm_campaign_default = os.getenv("UTM_CAMPAIGN_DEFAULT", "trafficgen")
         self.utm_mediums = _parse_kv_csv(os.getenv("REFERRER_UTM_MEDIUMS", ""))
-        self.utm_campaigns = _parse_kv_csv(os.getenv("REFERRER_UTM_CAMPAIGNS", ""))
 
         self.page = None
         self.context = None
@@ -180,13 +181,13 @@ class Session:
             utm_source = _slug_from_source(self.referrer_url)
             if utm_source and utm_source != "direct":
                 utm_medium = self.utm_mediums.get(utm_source, self.utm_medium_default)
-                utm_campaign = self.utm_campaigns.get(utm_source, self.utm_campaign_default)
+                utm_campaign = self.utm_campaign_default
                 q = {"utm_source": utm_source, "utm_medium": utm_medium, "utm_campaign": utm_campaign}
                 sep = "?" if "?" not in landing else "&"
                 landing = landing + sep + urlencode(q)
                 debug_print(self.debug, f"[S{self.id}] landing with UTM: {landing}")
             else:
-                debug_print(self.debug, f"[S{self.id}] landing direct (no valid source slug)")
+                debug_print(self.debug, f"[S{self.id}] landing direct (invalid source)")
         else:
             debug_print(self.debug, f"[S{self.id}] landing direct")
         await self._guarded_goto(landing)
