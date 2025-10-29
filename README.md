@@ -97,18 +97,6 @@ With `DEBUG=1` set in `.env`, you’ll see lines like:
 
 ---
 
-## ✅ Validating in Noibu
-- Run a short burst with a fixed header, e.g.:
-  ```env
-  REFERRER_HEADER_URLS=https://www.google.com/
-  REFERRER_WEIGHTS=100
-  DEBUG=1
-  ```
-- After a few minutes, filter sessions by time: **Referrer** should show **google.com** spikes.  
-- Restore your normal REFERRER mix after validation.
-
----
-
 ## 📁 Layout
 ```
 trafficgen/
@@ -126,13 +114,6 @@ noibu-traffic-gen.sh     # Helper script to install/run (chmod +x and execute)
 - Python 3.9+
 - Playwright (installed by the `.sh` script)
 - Chromium (installed by the `.sh` script)
-
----
-
-## 📝 Notes
-- Engine is **Chromium-only** (Firefox/WebKit branches removed).
-- No proxy/VPN rotation logic.
-- Designed for eCommerce catalogs (BigCommerce, Shopify, etc.).
 
 ---
 
