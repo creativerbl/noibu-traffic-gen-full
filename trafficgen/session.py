@@ -1,16 +1,16 @@
-
 import asyncio
 import os
 import random
 import re
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlencode, urlparse
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode, urlparse, urljoin
 
 from trafficgen.utils import think, same_origin, ExponentialBackoff, debug_print
 
-ALLOW_NAV_TIMEOUT = 20000
+ALLOW_NAV_TIMEOUT = 25000
 SEL_TIMEOUT = 15000
 
+# ---------------------- helpers: parsing & normalization ----------------------
 def _slug_from_source(src: str) -> str:
     if not src:
         return ""
@@ -30,7 +30,8 @@ def _slug_from_source(src: str) -> str:
     except Exception:
         return re.sub(r"\W+", "", s)
 
-def _parse_kv_csv(env_val: str) -> Dict[str, str]:
+def _parse_kv_csv(env_val: str, key_norm: bool = True) -> Dict[str, str]:
+    """Parse 'Kitchen:35,Bath:30' or 'google:organic' -> dict; keys optional normalized."""
     result: Dict[str, str] = {}
     s = (env_val or "").strip()
     if not s:
@@ -39,12 +40,30 @@ def _parse_kv_csv(env_val: str) -> Dict[str, str]:
         if not pair.strip() or ":" not in pair:
             continue
         k, v = pair.split(":", 1)
-        k = _slug_from_source(k.strip())
-        v = v.strip()
-        if k:
-            result[k] = v
+        k = k.strip()
+        if key_norm:
+            k = _normalize_label(k)
+        result[k] = v.strip()
     return result
 
+def _parse_prob_csv(env_val: str) -> Dict[str, float]:
+    """Parse 'Kitchen:0.65,Bath:0.45' -> {'kitchen':0.65,'bath':0.45}"""
+    out: Dict[str, float] = {}
+    raw = _parse_kv_csv(env_val, key_norm=True)
+    for k, v in raw.items():
+        try:
+            out[k] = max(0.0, min(1.0, float(v)))
+        except Exception:
+            continue
+    return out
+
+def _normalize_label(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+def _is_visible_text(s: str) -> bool:
+    return bool((s or "").strip())
+
+# ---------------------- Session class ----------------------
 class Session:
     def __init__(self,
                  session_id: int,
@@ -87,30 +106,50 @@ class Session:
         # UTM env
         self.utm_medium_default = os.getenv("UTM_MEDIUM_DEFAULT", "paid-social")
         self.utm_campaign_default = os.getenv("UTM_CAMPAIGN_DEFAULT", "trafficgen")
-        self.utm_mediums = _parse_kv_csv(os.getenv("REFERRER_UTM_MEDIUMS", ""))
+        self.utm_mediums = _parse_kv_csv(os.getenv("REFERRER_UTM_MEDIUMS", ""), key_norm=True)
 
-        # --- Human-like nav/scroll behavior (all .env driven) ---
-        # Wait strategy after goto: 'load' | 'domcontentloaded' | 'networkidle'
+        # Human-like nav/scroll behavior
         self.wait_until = os.getenv("PAGE_WAIT_UNTIL", "load").strip().lower()
         if self.wait_until not in ("load", "domcontentloaded", "networkidle"):
             self.wait_until = "load"
-
-        # Random settle delay after navigation (ms)
         self.post_nav_settle_min = int(os.getenv("POST_NAV_SETTLE_MIN_MS", "250"))
         self.post_nav_settle_max = int(os.getenv("POST_NAV_SETTLE_MAX_MS", "900"))
-
-        # Probability of scrolling after a pageview (0..1)
-        self.scroll_prob = float(os.getenv("SCROLL_PROB", "0.75"))
-        # Fraction of total page height to scroll to (min..max)
+        self.scroll_prob = float(os.getenv("SCROLL_PROB", "0.70"))
         self.scroll_depth_min = float(os.getenv("SCROLL_DEPTH_MIN", "0.35"))
-        self.scroll_depth_max = float(os.getenv("SCROLL_DEPTH_MAX", "0.95"))
-        # Number of scroll steps
+        self.scroll_depth_max = float(os.getenv("SCROLL_DEPTH_MAX", "0.90"))
         self.scroll_steps_min = int(os.getenv("SCROLL_STEPS_MIN", "2"))
         self.scroll_steps_max = int(os.getenv("SCROLL_STEPS_MAX", "6"))
+
+        # Top-nav / hotspots
+        self.nav_weights = _parse_kv_csv(os.getenv("NAV_CATEGORY_WEIGHTS", ""), key_norm=True)
+        self.nav_hotspot_names = [_normalize_label(x) for x in (os.getenv("NAV_HOTSPOT_NAMES","Kitchen,Bath")).split(",") if x.strip()]
+        self.nav_hotspot_extra_prob = _parse_prob_csv(os.getenv("NAV_HOTSPOT_EXTRA_CLICK_PROB","Kitchen:0.65,Bath:0.45"))
+        self.nav_pause_min = int(os.getenv("NAV_NAVIGATION_PAUSE_MS_MIN","400"))
+        self.nav_pause_max = int(os.getenv("NAV_NAVIGATION_PAUSE_MS_MAX","1100"))
+
+        # Coverage pass
+        self.coverage_prob = float(os.getenv("COVERAGE_RUN_PROB","0.15"))
+        self.coverage_max_clicks = int(os.getenv("COVERAGE_MAX_CLICKS","8"))
+        self.coverage_allow = [s.strip() for s in os.getenv("COVERAGE_SELECTOR_ALLOW",".hero a,.promo a,.featured a,.card a,button,.btn").split(",") if s.strip()]
+        self.coverage_block = [s.strip() for s in os.getenv("COVERAGE_SELECTOR_BLOCK",'[href*="logout"],[href^="mailto:"],[href^="tel:"],[href*="admin"],.social a').split(",") if s.strip()]
+
+        # Funnel gating
+        self.funnel_atc_rate = float(os.getenv("FUNNEL_ADD_TO_CART_RATE","0.30"))
+        self.funnel_checkout_rate = float(os.getenv("FUNNEL_CHECKOUT_START_RATE","0.50"))
+        self.funnel_max_cart_adds = int(os.getenv("FUNNEL_MAX_CART_ADDS_PER_SESSION","1"))
+        self.funnel_max_checkout_starts = int(os.getenv("FUNNEL_MAX_CHECKOUT_STARTS_PER_SESSION","1"))
+
+        # Flags per session
+        self.flag_is_atc_session = (random.random() < self.funnel_atc_rate)
+        self.flag_should_checkout = (self.flag_is_atc_session and (random.random() < self.funnel_checkout_rate))
+        self.did_add_to_cart = 0
+        self.did_start_checkout = 0
+        self.stop_requested = False
 
         self.page = None
         self.context = None
 
+    # ---------------------- context & navigation helpers ----------------------
     async def _new_context(self):
         cargs = dict(self.ctx_args)
         cargs["locale"] = self.locale
@@ -124,7 +163,6 @@ class Session:
         slow_pct = float(self.fault_profile.get("slow_request_fraction", 0.0))
         if slow_pct <= 0:
             return
-
         async def route_handler(route):
             if random.random() < slow_pct:
                 await asyncio.sleep(random.uniform(0.1, 0.6))
@@ -139,7 +177,6 @@ class Session:
         while True:
             try:
                 resp = await self.page.goto(url, timeout=ALLOW_NAV_TIMEOUT, wait_until=self.wait_until)
-                # Small human-like settle pause after navigation
                 settle = random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000)
                 await asyncio.sleep(settle)
                 return resp
@@ -149,19 +186,13 @@ class Session:
                     raise
 
     async def _maybe_scroll_page(self):
-        """Human-like scrolling: sometimes don't scroll; sometimes partial depth."""
-        # decide if we scroll at all
         if random.random() > max(0.0, min(1.0, self.scroll_prob)):
             debug_print(self.debug, f"[S{self.id}] no scroll (randomized)")
             return
-
-        # Ensure <body>
         try:
             await self.page.wait_for_selector("body", timeout=SEL_TIMEOUT)
         except Exception:
-            return  # if body never appears, skip
-
-        # Estimate page height safely
+            return
         try:
             height = await self.page.evaluate("""
                 () => {
@@ -178,43 +209,43 @@ class Session:
             """)
         except Exception:
             height = 2000
-
-        # Pick a random depth and step count
         depth_frac = max(0.0, min(1.0, random.uniform(self.scroll_depth_min, self.scroll_depth_max)))
         target = max(400, height * depth_frac)
         steps = max(1, min(10, random.randint(self.scroll_steps_min, self.scroll_steps_max)))
-
         for _ in range(steps):
             await self.page.mouse.wheel(0, target/steps)
             await think(self.think_cfg["scroll_min_ms"], self.think_cfg["scroll_max_ms"])
 
-    async def _click_by_text(self, text: str, exact: bool = False):
-        await self.global_qps.wait()
-        locator = self.page.get_by_text(text, exact=exact)
-        await locator.first.click(timeout=SEL_TIMEOUT)
-
-    async def _click_role(self, role: str, name: Optional[str] = None, exact: bool = False):
-        await self.global_qps.wait()
-        loc = self.page.get_by_role(role, name=name, exact=exact) if name else self.page.get_by_role(role)
-        await loc.first.click(timeout=SEL_TIMEOUT)
-
+        # ---------------------- flow control ----------------------
     async def run(self):
         await self._new_context()
         try:
-            flow = random.choice(self.flows or [{}])  # YAML doc
+            flow = random.choice(self.flows or [{}])
             if not flow:
                 return
             await self._run_scripted(flow)
         finally:
+            debug_print(self.debug, f"[S{self.id}] summary: atc={self.did_add_to_cart} checkout={self.did_start_checkout}")
             await self.context.close()
 
     async def _run_scripted(self, flow: dict):
         steps = flow.get("steps", [])
         await self._landing()
+
+        # NEW: Top-nav click-all with hotspot extras
+        await self._topnav_click_all_with_hotspots()
+
         for step in steps:
+            if self.stop_requested:
+                break
             await self._execute_step(step)
             await think(self.think_cfg["page_min_ms"], self.think_cfg["page_max_ms"])
 
+        # Optional coverage pass
+        if (not self.stop_requested) and random.random() < self.coverage_prob:
+            await self._coverage_click_pass()
+
+    # ---------------------- landing & steps ----------------------
     async def _landing(self):
         landing = self.origin + "/"
         if self.referrer_url and self.referrer_url != "direct":
@@ -258,6 +289,82 @@ class Session:
             ms = int(step.get("ms", 1000))
             await asyncio.sleep(ms / 1000.0)
 
+    # ---------------------- top nav logic ----------------------
+    async def _query_top_nav_links(self) -> List[Tuple[str, str]]:
+        """Return list of (label_normalized, href) for top navigation candidates."""
+        sel_list = [
+            "header nav a",
+            '[role="navigation"] a',
+            ".navPages-container a",
+            ".navPages a",
+            ".header-nav a",
+            "nav a",
+        ]
+        seen = {}
+        for sel in sel_list:
+            try:
+                loc = self.page.locator(sel)
+                count = await loc.count()
+                for i in range(min(count, 150)):
+                    try:
+                        el = loc.nth(i)
+                        text = (await el.inner_text(timeout=1000)).strip()
+                        if not _is_visible_text(text):
+                            continue
+                        href = await el.get_attribute("href", timeout=500)
+                        if not href:
+                            continue
+                        href = urljoin(self.origin + "/", href)
+                        if not same_origin(href, self.allowlist):
+                            continue
+                        key = _normalize_label(text)
+                        cur = seen.get(key)
+                        if not cur:
+                            seen[key] = href
+                        else:
+                            if key in self.nav_weights and cur not in self.nav_weights and href in self.nav_weights:
+                                seen[key] = href
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        items = [(k, v) for k, v in seen.items() if k]
+        items = [(k, v) for (k, v) in items if not v.rstrip("/").endswith(self.origin.rstrip("/"))]
+        return items
+
+    async def _topnav_click_all_with_hotspots(self):
+        """Click ALL discovered categories once, then optional extra clicks for hotspots."""
+        links = await self._query_top_nav_links()
+        if not links:
+            debug_print(self.debug, f"[S{self.id}] top-nav: nothing discovered")
+            return
+        random.shuffle(links)
+        for label_norm, href in links:
+            if self.stop_requested:
+                break
+            await self._click_nav_link(label_norm, href)
+        for hot in self.nav_hotspot_names:
+            if self.stop_requested:
+                break
+            prob = self.nav_hotspot_extra_prob.get(hot, 0.0)
+            if prob > 0 and random.random() < prob:
+                target = next(((ln, h) for (ln, h) in links if ln == _normalize_label(hot)), None)
+                if target:
+                    await self._click_nav_link(target[0], target[1])
+
+    async def _click_nav_link(self, label_norm: str, href: str):
+        debug_print(self.debug, f"[S{self.id}] nav → {label_norm} ({href})")
+        await self._guarded_goto(href)
+        await self._maybe_scroll_page()
+        await asyncio.sleep(random.uniform(self.nav_pause_min/1000, self.nav_pause_max/1000))
+        if not self.stop_requested:
+            await self._category_micro_behaviors()
+
+    async def _category_micro_behaviors(self):
+        await self._sort_or_filter()
+        await self._open_random_pdp(count=random.randint(1, 2))
+
+    # ---------------------- actions ----------------------
     async def _search(self, query: Optional[str]):
         if not query:
             query = random.choice(["shirt", "hat", "bag", "gift", "shoe"])
@@ -271,7 +378,7 @@ class Session:
         await self._maybe_scroll_page()
 
     async def _open_random_category(self):
-        nav_candidates = self.page.get_by_role("link", name=re.compile("(Shop|All|Men|Women|Accessories|Catalog|Sale|New)", re.I))
+        nav_candidates = self.page.get_by_role("link", name=re.compile("(Shop|All|Men|Women|Accessories|Catalog|Sale|New|Kitchen|Bath)", re.I))
         count = await nav_candidates.count()
         if count > 0 and random.random() < 0.7:
             idx = random.randint(0, min(count-1, 5))
@@ -284,6 +391,8 @@ class Session:
     async def _open_random_pdp(self, count: int = 1):
         count = max(1, min(count, 3))
         for _ in range(count):
+            if self.stop_requested:
+                break
             grid = self.page.locator("a.card-figure, a.card-title, a.product-title, a[href*='/products/']")
             try:
                 n = await grid.count()
@@ -293,26 +402,53 @@ class Session:
                 i = random.randint(0, min(n-1, 15))
                 await grid.nth(i).click(timeout=SEL_TIMEOUT)
                 await self._maybe_scroll_page()
+                if self.flag_is_atc_session and self.did_add_to_cart < self.funnel_max_cart_adds:
+                    await self._add_to_cart()
+                    if self.flag_should_checkout and self.did_start_checkout < self.funnel_max_checkout_starts:
+                        await self._view_cart()
+                        await self._start_checkout()
+                        if self.did_start_checkout:
+                            debug_print(self.debug, f"[S{self.id}] checkout reached – pausing flow")
+                            self.stop_requested = True
+                            return
             else:
                 break
 
     async def _sort_or_filter(self):
-        try:
-            sort_sel = self.page.locator("select[name='sort'], select#sort, select[name*='Sort']")
-            await sort_sel.first.select_option(index=random.randint(0, 2), timeout=SEL_TIMEOUT)
-        except Exception:
-            pass
-        await self._maybe_scroll_page()
+        sort_prob = float(os.getenv("CATEGORY_SORT_PROB", "0.30"))
+        filter_prob = float(os.getenv("CATEGORY_FILTER_PROB", "0.15"))
+        if random.random() < sort_prob:
+            try:
+                sort_sel = self.page.locator("select[name='sort'], select#sort, select[name*='Sort']")
+                await sort_sel.first.select_option(index=random.randint(0, 2), timeout=SEL_TIMEOUT)
+            except Exception:
+                pass
+            await self._maybe_scroll_page()
+        if random.random() < filter_prob:
+            try:
+                filt = self.page.locator("input[type='checkbox'], .facetedSearch-option--checkbox input")
+                if await filt.count() > 0:
+                    await filt.nth(0).check(timeout=SEL_TIMEOUT)
+                    await asyncio.sleep(0.5)
+            except Exception:
+                pass
+            await self._maybe_scroll_page()
 
     async def _add_to_cart(self):
+        if self.did_add_to_cart >= self.funnel_max_cart_adds:
+            return
         try:
             btn = self.page.get_by_role("button", name=re.compile("add to cart", re.I))
             await btn.first.click(timeout=SEL_TIMEOUT)
+            self.did_add_to_cart += 1
+            return
         except Exception:
-            try:
-                await self.page.click("button#form-action-addToCart, button[name='add']", timeout=SEL_TIMEOUT)
-            except Exception:
-                return
+            pass
+        try:
+            await self.page.click("button#form-action-addToCart, button[name='add']", timeout=SEL_TIMEOUT)
+            self.did_add_to_cart += 1
+        except Exception:
+            return
         await think(500, 1200)
 
     async def _view_cart(self):
@@ -324,12 +460,16 @@ class Session:
         await self._maybe_scroll_page()
 
     async def _start_checkout(self):
+        if self.did_start_checkout >= self.funnel_max_checkout_starts:
+            return
         try:
             btn = self.page.get_by_role("link", name=re.compile("checkout", re.I))
             await btn.first.click(timeout=SEL_TIMEOUT)
+            self.did_start_checkout += 1
         except Exception:
             try:
                 await self.page.click("a[href*='/checkout']", timeout=SEL_TIMEOUT)
+                self.did_start_checkout += 1
             except Exception:
                 return
         await self._maybe_scroll_page()
@@ -342,58 +482,7 @@ class Session:
         await self._maybe_scroll_page()
 
     async def _complete_checkout(self):
-        card_no = os.getenv("BC_TEST_CARD_NUMBER", "")
-        exp = os.getenv("BC_TEST_EXP", "")
-        cvv = os.getenv("BC_TEST_CVV", "")
-        name = os.getenv("BC_TEST_NAME", "Test User")
-
-        try:
-            await self.page.get_by_label(re.compile("email", re.I)).fill(f"demo+{random.randint(1000,9999)}@noibu.com", timeout=SEL_TIMEOUT)
-        except Exception:
-            pass
-
-        fields = {
-            "first name": "Demo",
-            "last name": "User",
-            "address": "123 Test St",
-            "city": "Ottawa",
-            "postal": "K1A0B1",
-            "zip": "10001",
-            "state": "ON",
-            "province": "ON",
-            "phone": "5551231234",
-        }
-        for label, val in fields.items():
-            try:
-                await self.page.get_by_label(re.compile(label, re.I)).fill(val, timeout=5000)
-            except Exception:
-                continue
-
-        for txt in ["Continue", "Next", "Proceed"]:
-            try:
-                await self.page.get_by_role("button", name=re.compile(txt, re.I)).click(timeout=5000)
-                await asyncio.sleep(1.0)
-            except Exception:
-                pass
-
-        if not card_no:
-            return
-
-        try:
-            await self._fill_card_field("number", card_no)
-            await self._fill_card_field("name", name)
-            await self._fill_card_field("expiry|exp", exp)
-            await self._fill_card_field("cvv|cvc", cvv)
-        except Exception:
-            return
-
-        for lab in ["Pay", "Place Order", "Complete Order"]:
-            try:
-                await self.page.get_by_role("button", name=re.compile(lab, re.I)).click(timeout=SEL_TIMEOUT)
-                await asyncio.sleep(2.0)
-                break
-            except Exception:
-                continue
+        return
 
     async def _fill_card_field(self, label_regex: str, value: str):
         try:
@@ -411,3 +500,39 @@ class Session:
             await self.page.fill(f"input[placeholder*='{label_regex}'], input[name*='{label_regex}']", value, timeout=2000)
         except Exception:
             pass
+
+    # ---------------------- coverage pass ----------------------
+    async def _coverage_click_pass(self):
+        try:
+            await self.page.wait_for_selector("body", timeout=SEL_TIMEOUT)
+        except Exception:
+            return
+        allow = ", ".join(self.coverage_allow)
+        loc = self.page.locator(allow)
+        try:
+            total = await loc.count()
+        except Exception:
+            total = 0
+        if total == 0:
+            return
+        indices = list(range(min(total, 100)))
+        random.shuffle(indices)
+        clicks = 0
+        for i in indices:
+            if clicks >= self.coverage_max_clicks or self.stop_requested:
+                break
+            el = loc.nth(i)
+            try:
+                href = await el.get_attribute("href", timeout=200) or ""
+                blocked = any(b in href for b in [s.replace('[href*="','').replace('"]','') for s in self.coverage_block if 'href*="' in s])
+                if blocked:
+                    continue
+            except Exception:
+                pass
+            try:
+                await el.click(timeout=SEL_TIMEOUT)
+                clicks += 1
+                await self._maybe_scroll_page()
+                await asyncio.sleep(random.uniform(0.2, 0.8))
+            except Exception:
+                continue
