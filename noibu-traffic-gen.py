@@ -1,7 +1,12 @@
 
 # noibu-traffic-gen.py — Chromium-only runner with .env-driven referrers & devices
 import os, asyncio, math
+from dotenv import load_dotenv  # 👈 ensure .env is loaded into process env
 from trafficgen.runner import Runner, RunnerConfig
+
+# Load .env from the current working directory (repo root)
+# Set override=False so exported shell vars still take precedence if set.
+load_dotenv(override=False)
 
 def _parse_csv(s):
     return [x.strip() for x in (s or "").split(",")]
@@ -99,6 +104,7 @@ def main():
         referrers=build_referrers_from_env(),
     )
 
+    print(f">> Running noibu-traffic-gen.py …")
     print(f"BOOT: {sessions_per_min}/min, avg {avg_session_min}min; origin={origin}", flush=True)
     try:
         asyncio.run(Runner(cfg).run())
