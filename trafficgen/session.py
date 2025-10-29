@@ -18,14 +18,14 @@ def _slug_from_source(src: str) -> str:
         return "direct"
     try:
         if "://" in s:
-            host = urlparse(s).netloc
+            netloc = urlparse(s).netloc
         else:
-            host = s
-        host = re.sub(r"^www\.", "", host)
-        parts = host.split(".")
+            netloc = s
+        netloc = re.sub(r"^www\.", "", netloc)
+        parts = netloc.split(".")
         if len(parts) >= 2:
             return parts[-2]
-        return host
+        return netloc
     except Exception:
         return re.sub(r"\W+", "", s)
 
@@ -77,11 +77,14 @@ class Session:
         self.global_qps = global_qps
         self.debug = debug
         self.fault_profile = fault_profile or {}
-
-        # NEW: per-session referrer (None for direct)
         self.referrer_url = (referrer_url or "").strip() or None
         if self.referrer_url and self.referrer_url.lower() == "direct":
-            self.referrer_url = None
+            self.referrer_url = "direct"
+
+        self.utm_medium_default = os.getenv("UTM_MEDIUM_DEFAULT", "organic")
+        self.utm_campaign_default = os.getenv("UTM_CAMPAIGN_DEFAULT", "trafficgen")
+        self.utm_mediums = _parse_kv_csv(os.getenv("REFERRER_UTM_MEDIUMS", ""))
+        self.utm_campaigns = _parse_kv_csv(os.getenv("REFERRER_UTM_CAMPAIGNS", ""))
 
         self.page = None
         self.context = None
@@ -96,11 +99,9 @@ class Session:
         await self._install_faults()
 
     async def _install_faults(self):
-        # Optional, modest delay on a small fraction of requests
         slow_pct = float(self.fault_profile.get("slow_request_fraction", 0.0))
         if slow_pct <= 0:
             return
-
         async def route_handler(route):
             if random.random() < slow_pct:
                 await asyncio.sleep(random.uniform(0.1, 0.6))
@@ -115,20 +116,16 @@ class Session:
         while True:
             try:
                 return await self.page.goto(url, timeout=ALLOW_NAV_TIMEOUT, wait_until="domcontentloaded")
-            except Exception as e:
-                # backoff on 4xx/5xx/429 or timeouts
+            except Exception:
                 await backoff.wait()
                 if backoff.attempts > 5:
                     raise
 
     async def _scroll_page(self):
-        # Wait until <body> exists (handles cases where document.body is null briefly)
         try:
             await self.page.wait_for_selector("body", timeout=SEL_TIMEOUT)
         except Exception:
-            return  # if body never appears, just skip scrolling
-
-        # Compute a safe page height with multiple fallbacks; default to 2000 px
+            return
         try:
             height = await self.page.evaluate("""
                 () => {
@@ -142,11 +139,10 @@ class Session:
                   const h = Math.max( ...vals, 0 );
                   return (h && isFinite(h)) ? h : 2000;
                 }
-            """)
+            """ )
         except Exception:
-            height = 2000  # last-ditch fallback
-
-        steps = max(3, min(8, int(height / 800)))  # 3–8 steps based on page height
+            height = 2000
+        steps = max(3, min(8, int(height / 800)))
         for _ in range(steps):
             await self.page.mouse.wheel(0, height / steps)
             await think(self.think_cfg["scroll_min_ms"], self.think_cfg["scroll_max_ms"])
@@ -163,18 +159,11 @@ class Session:
 
     async def run(self):
         await self._new_context()
-
         try:
-            flow = random.choice(self.flows or [{}])  # each is a YAML doc
+            flow = random.choice(self.flows or [{}])
             if not flow:
                 return
-            ftype = flow.get("type", "scripted")
-            if ftype == "scripted":
-                await self._run_scripted(flow)
-            elif ftype == "markov":
-                await self._run_markov(flow)
-            else:
-                await self._run_scripted(flow)
+            await self._run_scripted(flow)
         finally:
             await self.context.close()
 
@@ -185,65 +174,21 @@ class Session:
             await self._execute_step(step)
             await think(self.think_cfg["page_min_ms"], self.think_cfg["page_max_ms"])
 
-    async def _run_markov(self, flow: dict):
-        states = flow.get("states", {})
-        current = flow.get("start")
-        max_steps = int(flow.get("max_steps", 10))
-        await self._landing()
-        for _ in range(max_steps):
-            s = states.get(current) or {}
-            for step in s.get("actions", []):
-                await self._execute_step(step)
-                await think(self.think_cfg["page_min_ms"], self.think_cfg["page_max_ms"])
-            # choose next
-            trans = s.get("transitions", [])
-            if not trans:
-                break
-            weights = [max(float(t.get("weight", 1.0)), 0.0) for t in trans]
-            total = sum(weights) or 1.0
-            r = random.uniform(0, total)
-            up = 0
-            chosen = trans[-1]
-            for t, w in zip(trans, weights):
-                up += w
-                if r <= up:
-                    chosen = t
-                    break
-            nxt = chosen.get("to")
-            if nxt in (None, "END"):
-                break
-            current = nxt
-
     async def _landing(self):
-        """
-        Build landing URL using .env-driven UTM rules.
-        - If referrer is None => direct (no UTM params).
-        - Else add utm_source + (utm_medium from per-source map or default) + (utm_campaign default).
-        """
         landing = self.origin + "/"
-        # Only add UTM for non-direct referrers
-        ref = self.referrer_url
-        if ref:
-            utm_source = _slug_from_source(ref)
+        if self.referrer_url and self.referrer_url != "direct":
+            utm_source = _slug_from_source(self.referrer_url)
             if utm_source and utm_source != "direct":
-                utm_campaign = os.getenv("UTM_CAMPAIGN_DEFAULT", "trafficgen")
-                utm_medium_default = os.getenv("UTM_MEDIUM_DEFAULT", "paid-social")
-                utm_medium_map = _parse_kv_csv(os.getenv("REFERRER_UTM_MEDIUMS", ""))
-                utm_medium = utm_medium_map.get(utm_source, utm_medium_default)
-                from urllib.parse import urlencode
-                q = {
-                    "utm_source": utm_source,
-                    "utm_medium": utm_medium,
-                    "utm_campaign": utm_campaign,
-                }
+                utm_medium = self.utm_mediums.get(utm_source, self.utm_medium_default)
+                utm_campaign = self.utm_campaigns.get(utm_source, self.utm_campaign_default)
+                q = {"utm_source": utm_source, "utm_medium": utm_medium, "utm_campaign": utm_campaign}
                 sep = "?" if "?" not in landing else "&"
                 landing = landing + sep + urlencode(q)
                 debug_print(self.debug, f"[S{self.id}] landing with UTM: {landing}")
             else:
-                debug_print(self.debug, f"[S{self.id}] landing direct (invalid source)")
+                debug_print(self.debug, f"[S{self.id}] landing direct (no valid source slug)")
         else:
             debug_print(self.debug, f"[S{self.id}] landing direct")
-
         await self._guarded_goto(landing)
         await self._scroll_page()
 
@@ -275,26 +220,22 @@ class Session:
     async def _search(self, query: Optional[str]):
         if not query:
             query = random.choice(["shirt", "hat", "bag", "gift", "shoe"])
-        # try search field
         try:
             sf = self.page.get_by_placeholder(re.compile("Search", re.I))
             await sf.click(timeout=SEL_TIMEOUT)
             await sf.fill(query, timeout=SEL_TIMEOUT)
             await sf.press("Enter")
         except Exception:
-            # fallback: query param
             await self._guarded_goto(f"{self.origin}/search.php?search_query={query}")
         await self._scroll_page()
 
     async def _open_random_category(self):
-        # Prefer nav links that look like categories
         nav_candidates = self.page.get_by_role("link", name=re.compile("(Shop|All|Men|Women|Accessories|Catalog|Sale|New)", re.I))
         count = await nav_candidates.count()
         if count > 0 and random.random() < 0.7:
             idx = random.randint(0, min(count-1, 5))
             await nav_candidates.nth(idx).click(timeout=SEL_TIMEOUT)
         else:
-            # known BigCommerce paths that often exist
             cand = random.choice(["/all/", "/categories/", "/shop/"])
             await self._guarded_goto(f"{self.origin}{cand}")
         await self._scroll_page()
@@ -303,7 +244,10 @@ class Session:
         count = max(1, min(count, 3))
         for _ in range(count):
             grid = self.page.locator("a.card-figure, a.card-title, a.product-title, a[href*='/products/']")
-            n = await grid.count()
+            try:
+                n = await grid.count()
+            except Exception:
+                n = 0
             if n > 0:
                 i = random.randint(0, min(n-1, 15))
                 await grid.nth(i).click(timeout=SEL_TIMEOUT)
@@ -312,7 +256,6 @@ class Session:
                 break
 
     async def _sort_or_filter(self):
-        # Try sort dropdowns
         try:
             sort_sel = self.page.locator("select[name='sort'], select#sort, select[name*='Sort']")
             await sort_sel.first.select_option(index=random.randint(0, 2), timeout=SEL_TIMEOUT)
@@ -321,7 +264,6 @@ class Session:
         await self._scroll_page()
 
     async def _add_to_cart(self):
-        # On PDP: click Add to Cart
         try:
             btn = self.page.get_by_role("button", name=re.compile("add to cart", re.I))
             await btn.first.click(timeout=SEL_TIMEOUT)
@@ -352,7 +294,6 @@ class Session:
         await self._scroll_page()
 
     async def _content_page(self, slug: str):
-        # includes Help/Shipping & Returns/Blog/Contact
         slugs = ["/contact-us/", "/shipping-returns/", "/blog/", "/help/"]
         if slug and slug.startswith("/"):
             slugs.insert(0, slug)
@@ -360,23 +301,16 @@ class Session:
         await self._scroll_page()
 
     async def _complete_checkout(self):
-        """
-        Best-effort checkout completion for BigCommerce test mode.
-        Handles common hosted checkout flows; falls back to abandon if selectors differ.
-        """
         card_no = os.getenv("BC_TEST_CARD_NUMBER", "")
         exp = os.getenv("BC_TEST_EXP", "")
         cvv = os.getenv("BC_TEST_CVV", "")
         name = os.getenv("BC_TEST_NAME", "Test User")
 
-        # email + shipping step
         try:
-            # Email
             await self.page.get_by_label(re.compile("email", re.I)).fill(f"demo+{random.randint(1000,9999)}@noibu.com", timeout=SEL_TIMEOUT)
         except Exception:
             pass
 
-        # Common shipping fields
         fields = {
             "first name": "Demo",
             "last name": "User",
@@ -394,7 +328,6 @@ class Session:
             except Exception:
                 continue
 
-        # continue/review
         for txt in ["Continue", "Next", "Proceed"]:
             try:
                 await self.page.get_by_role("button", name=re.compile(txt, re.I)).click(timeout=5000)
@@ -402,13 +335,10 @@ class Session:
             except Exception:
                 pass
 
-        # Payment (card)
         if not card_no:
-            return  # config requires env secrets; otherwise consider abandoned
+            return
 
-        # Some checkouts use iframes; attempt common selectors and fallbacks
         try:
-            # Try generic card fields (may be in iframes)
             await self._fill_card_field("number", card_no)
             await self._fill_card_field("name", name)
             await self._fill_card_field("expiry|exp", exp)
@@ -416,7 +346,6 @@ class Session:
         except Exception:
             return
 
-        # Place order
         for lab in ["Pay", "Place Order", "Complete Order"]:
             try:
                 await self.page.get_by_role("button", name=re.compile(lab, re.I)).click(timeout=SEL_TIMEOUT)
@@ -426,20 +355,17 @@ class Session:
                 continue
 
     async def _fill_card_field(self, label_regex: str, value: str):
-        # Attempt label targeting; iframes commonly used -> search frames too
         try:
             await self.page.get_by_label(re.compile(label_regex, re.I)).fill(value, timeout=SEL_TIMEOUT)
             return
         except Exception:
             pass
-        # search frames for inputs with placeholders
         for frame in self.page.frames:
             try:
                 await frame.get_by_placeholder(re.compile(label_regex, re.I)).fill(value, timeout=2000)
                 return
             except Exception:
                 continue
-        # generic inputs
         try:
             await self.page.fill(f"input[placeholder*='{label_regex}'], input[name*='{label_regex}']", value, timeout=2000)
         except Exception:
