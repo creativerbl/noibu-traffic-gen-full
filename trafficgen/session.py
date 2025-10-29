@@ -3,11 +3,37 @@ import os
 import random
 import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode, urlparse
 
 from trafficgen.utils import think, same_origin, ExponentialBackoff, debug_print
 
 ALLOW_NAV_TIMEOUT = 20000
 SEL_TIMEOUT = 15000
+
+def _slug_from_source(src: str) -> str:
+    """
+    Convert a source like 'https://www.google.com' or 'google' into a clean slug 'google'.
+    """
+    if not src:
+        return ""
+    s = src.strip().lower()
+    if s == "direct":
+        return "direct"
+    # If it's a URL, take netloc and strip common prefixes
+    try:
+        if "://" in s:
+            netloc = urlparse(s).netloc
+        else:
+            # treat as domain or word
+            netloc = s
+        netloc = re.sub(r"^www\.", "", netloc)
+        # take root label (e.g., google from google.com)
+        parts = netloc.split(".")
+        if len(parts) >= 2:
+            return parts[-2]
+        return netloc
+    except Exception:
+        return re.sub(r"\W+", "", s)
 
 class Session:
     def __init__(self,
@@ -42,10 +68,10 @@ class Session:
         self.global_qps = global_qps
         self.debug = debug
         self.fault_profile = fault_profile or {}
-        # NEW: per-session referrer (None or 'direct' => no header)
+        # NEW: per-session referrer *source* (string like 'direct' or url); used for UTM
         self.referrer_url = (referrer_url or "").strip() or None
         if self.referrer_url and self.referrer_url.lower() == "direct":
-            self.referrer_url = None
+            self.referrer_url = "direct"
 
         self.page = None
         self.context = None
@@ -55,23 +81,11 @@ class Session:
         cargs["locale"] = self.locale
         cargs["timezone_id"] = self.tz
         cargs.setdefault("ignore_https_errors", True)
-        # Inject Referer header if configured for this session
-        if self.referrer_url:
-            # Normalize: ensure scheme and trailing slash
-            ref = self.referrer_url
-            if not re.match(r'^https?://', ref, re.I):
-                ref = "https://" + ref.lstrip("/")
-            if not ref.endswith("/"):
-                ref = ref + "/"
-            cargs.setdefault("extra_http_headers", {})
-            cargs["extra_http_headers"] = {**cargs["extra_http_headers"], "Referer": ref}
-            debug_print(self.debug, f"[S{self.id}] Using Referer={ref}")
         self.context = await self.browser.new_context(**cargs)
         self.page = await self.context.new_page()
         await self._install_faults()
 
     async def _install_faults(self):
-        # Optional, modest delay on a small fraction of requests
         slow_pct = float(self.fault_profile.get("slow_request_fraction", 0.0))
         if slow_pct <= 0:
             return
@@ -91,19 +105,15 @@ class Session:
             try:
                 return await self.page.goto(url, timeout=ALLOW_NAV_TIMEOUT, wait_until="domcontentloaded")
             except Exception as e:
-                # backoff on 4xx/5xx/429 or timeouts
                 await backoff.wait()
                 if backoff.attempts > 5:
                     raise
 
     async def _scroll_page(self):
-        # Wait until <body> exists (handles cases where document.body is null briefly)
         try:
             await self.page.wait_for_selector("body", timeout=SEL_TIMEOUT)
         except Exception:
-            return  # if body never appears, just skip scrolling
-
-        # Compute a safe page height with multiple fallbacks; default to 2000 px
+            return
         try:
             height = await self.page.evaluate("""
                 () => {
@@ -117,11 +127,10 @@ class Session:
                   const h = Math.max( ...vals, 0 );
                   return (h && isFinite(h)) ? h : 2000;
                 }
-            """)
+            """ )
         except Exception:
-            height = 2000  # last-ditch fallback
-
-        steps = max(3, min(8, int(height / 800)))  # 3–8 steps based on page height
+            height = 2000
+        steps = max(3, min(8, int(height / 800)))
         for _ in range(steps):
             await self.page.mouse.wheel(0, height / steps)
             await think(self.think_cfg["scroll_min_ms"], self.think_cfg["scroll_max_ms"])
@@ -190,7 +199,33 @@ class Session:
             current = nxt
 
     async def _landing(self):
-        await self._guarded_goto(self.origin)
+        """
+        Landing now supports UTM-based source attribution.
+        If referrer source is not 'direct', append utm_source (& optional medium/campaign)
+        to the very first landing URL so analytics can classify it.
+        """
+        utm_medium_default = os.getenv("UTM_MEDIUM_DEFAULT", "organic")
+        utm_campaign_default = os.getenv("UTM_CAMPAIGN_DEFAULT", "trafficgen")
+
+        # Build landing URL
+        landing = self.origin + "/"
+        if self.referrer_url and self.referrer_url != "direct":
+            utm_source = _slug_from_source(self.referrer_url)
+            if utm_source and utm_source != "direct":
+                q = {
+                    "utm_source": utm_source,
+                    "utm_medium": utm_medium_default,
+                    "utm_campaign": utm_campaign_default,
+                }
+                sep = "?" if "?" not in landing else "&"
+                landing = landing + sep + urlencode(q)
+                debug_print(self.debug, f"[S{self.id}] landing with UTM: {landing}")
+            else:
+                debug_print(self.debug, f"[S{self.id}] landing direct (no valid source slug)")
+        else:
+            debug_print(self.debug, f"[S{self.id}] landing direct")
+
+        await self._guarded_goto(landing)
         await self._scroll_page()
 
     async def _execute_step(self, step: dict):
