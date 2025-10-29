@@ -2,3 +2,4 @@
 *.patch
 trafficgen/.DS_Store
 trafficgen/flows/.DS_Store
+.DS_Store
