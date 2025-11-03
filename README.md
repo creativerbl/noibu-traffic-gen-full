@@ -8,10 +8,10 @@ A realistic web traffic simulation tool for generating synthetic user sessions o
 - Launches **Playwright / Chromium** sessions that behave like humans (random waits, optional scrolling, real clicks).
 - Lands with **true HTTP Referer** (from `.env`) and optional **UTM** tags.
 - Clicks through **top navigation** (extra focus on **Kitchen** and **Bath** by default), opens **PDPs**, and follows a **light funnel**:
-  - ~30% sessions add to cart.
-  - ~50% of those start checkout (then pause by design).
 
-Proxy/VPN logic has been **removed**; this project uses a **Chromium-only** engine.
+<img width="1329" height="941" alt="image" src="https://github.com/user-attachments/assets/e93680d3-389e-42ca-8279-b436b55e5640" />
+
+<img width="1333" height="895" alt="image" src="https://github.com/user-attachments/assets/ab67c87d-a6e2-410e-a3b4-9c52d46b75d8" />
 
 ---
 
@@ -22,6 +22,7 @@ Proxy/VPN logic has been **removed**; this project uses a **Chromium-only** engi
 chmod +x ./noibu-traffic-gen.sh
 ./noibu-traffic-gen.sh
 ```
+
 
 The script will:
 1) Install Playwright’s Chromium browser (if missing).  
