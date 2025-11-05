@@ -1,5 +1,6 @@
 # trafficgen/session.py (ready-to-drop)
 import asyncio
+import contextlib
 import os
 import random
 import re
@@ -220,7 +221,24 @@ class Session:
             await think(self.think_cfg["scroll_min_ms"], self.think_cfg["scroll_max_ms"])
 
     async def run(self):
-        await self._new_context()
+        self.page = None
+        self.context = None
+        backoff = ExponentialBackoff(base=0.4, factor=1.7, max_wait=3.0)
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                await self._new_context()
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                debug_print(self.debug, f"[S{self.id}] new_context failed (attempt {attempt + 1}): {exc}")
+                await backoff.wait()
+        else:
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError("browser context creation failed")
         try:
             flow = random.choice(self.flows or [{}])
             if not flow:
@@ -228,7 +246,11 @@ class Session:
             await self._run_scripted(flow)
         finally:
             debug_print(self.debug, f"[S{self.id}] summary: atc={self.did_add_to_cart} checkout={self.did_start_checkout}")
-            await self.context.close()
+            if self.context:
+                with contextlib.suppress(Exception):
+                    await self.context.close()
+            self.context = None
+            self.page = None
 
     async def _run_scripted(self, flow: dict):
         steps = flow.get("steps", [])
