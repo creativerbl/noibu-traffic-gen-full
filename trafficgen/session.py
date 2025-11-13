@@ -141,20 +141,7 @@ class Session:
         self.scroll_steps_max = int(os.getenv("SCROLL_STEPS_MAX","6"))
 
         # Top-nav & hotspots
-        raw_nav_weights = _parse_kv_csv(os.getenv("NAV_CATEGORY_WEIGHTS",""), normalize_keys=True)
-        self.nav_weights = {}
-        for key, raw_val in raw_nav_weights.items():
-            try:
-                cleaned = raw_val.strip()
-                if cleaned.endswith("%"):
-                    cleaned = cleaned[:-1]
-                prob = float(cleaned)
-                if prob > 1.0:
-                    prob = prob / 100.0
-            except Exception:
-                continue
-            prob = max(0.0, min(1.0, prob))
-            self.nav_weights[key] = prob
+        self.nav_weights = _parse_kv_csv(os.getenv("NAV_CATEGORY_WEIGHTS",""), normalize_keys=True)
         self.nav_hotspot_names = [_normalize_label(x) for x in os.getenv("NAV_HOTSPOT_NAMES","Kitchen,Bath").split(",") if x.strip()]
         self.nav_hotspot_extra_prob = _parse_prob_csv(os.getenv("NAV_HOTSPOT_EXTRA_CLICK_PROB","Kitchen:0.65,Bath:0.45"))
         self.nav_pause_min = int(os.getenv("NAV_NAVIGATION_PAUSE_MS_MIN","400"))
@@ -620,61 +607,19 @@ class Session:
             debug_print(self.debug, f"[S{self.id}] top-nav: none found")
             return
         random.shuffle(links)
-        have_weights = bool(self.nav_weights)
-        eligible: List[Tuple[str, Any, float]] = []
         for label_norm, el in links:
             if self.stop_requested:
                 break
-            if have_weights:
-                weight_key = self._match_weight_key(label_norm)
-                if weight_key is None:
-                    continue
-                prob = self.nav_weights.get(weight_key, 0.0)
-            else:
-                prob = 1.0
-            eligible.append((label_norm, el, prob))
-
-        clicked = False
-        for label_norm, el, prob in eligible:
-            if self.stop_requested:
-                break
-            if random.random() < prob:
-                await self._click_nav_el(label_norm, el)
-                clicked = True
-
-        if have_weights and not clicked and eligible:
-            # All probabilistic draws missed; click the strongest weighted nav
-            # item to avoid a nav-less session.
-            label_norm, el, _ = max(eligible, key=lambda item: item[2])
-            if not self.stop_requested:
-                await self._click_nav_el(label_norm, el)
-                clicked = True
+            await self._click_nav_el(label_norm, el)
         for hot in self.nav_hotspot_names:
             if self.stop_requested:
                 break
             label = _normalize_label(hot)
             prob = self.nav_hotspot_extra_prob.get(label, 0.0)
             if prob > 0 and random.random() < prob:
-                target = self._find_nav_target(links, label)
+                target = next(((ln, e) for (ln, e) in links if ln == label), None)
                 if target:
                     await self._click_nav_el(target[0], target[1])
-
-    def _match_weight_key(self, label_norm: str) -> Optional[str]:
-        if label_norm in self.nav_weights:
-            return label_norm
-        for key in self.nav_weights.keys():
-            if key in label_norm or label_norm in key:
-                return key
-        return None
-
-    def _find_nav_target(self, links: List[Tuple[str, Any]], target_label: str) -> Optional[Tuple[str, Any]]:
-        for label, el in links:
-            if label == target_label:
-                return (label, el)
-        for label, el in links:
-            if target_label in label or label in target_label:
-                return (label, el)
-        return None
 
     async def _click_nav_el(self, label_norm: str, el):
         try:
