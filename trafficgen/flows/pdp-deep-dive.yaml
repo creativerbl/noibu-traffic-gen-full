@@ -1,7 +1,6 @@
 type: scripted
 name: "pdp-deep-dive"
 steps:
-  - action: goto_garden_page
   - action: open_random_category
   - action: open_random_pdp
   - action: open_random_pdp
