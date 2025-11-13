@@ -177,6 +177,13 @@ class Session:
         self.did_start_checkout = 0
         self.stop_requested = False
 
+        # Page-specific behavior guards
+        self._home_action_done = False
+        self._garden_action_done = False
+        self._home_pass_in_progress = False
+        self._garden_pass_in_progress = False
+        self._last_special_path: Optional[str] = None
+
         self.page = None
         self.context = None
 
@@ -209,29 +216,234 @@ class Session:
                     raise
 
     async def _maybe_scroll_page(self):
-        if random.random() > max(0.0, min(1.0, self.scroll_prob)):
-            debug_print(self.debug, f"[S{self.id}] no scroll (randomized)")
+        did_scroll = False
+        try:
+            if random.random() > max(0.0, min(1.0, self.scroll_prob)):
+                debug_print(self.debug, f"[S{self.id}] no scroll (randomized)")
+                return
+            try:
+                await self.page.wait_for_selector("body", timeout=SEL_TIMEOUT)
+            except Exception:
+                return
+            try:
+                height = await self.page.evaluate("""
+                    () => {
+                      const d=document.documentElement,b=document.body;
+                      const vals=[d.scrollHeight,b.scrollHeight,d.offsetHeight,b.offsetHeight,d.clientHeight,b.clientHeight].filter(v=>typeof v==='number');
+                      const h=Math.max(...vals,0); return (h && isFinite(h))?h:2000;
+                    }
+                """)
+            except Exception:
+                height = 2000
+            depth_frac = max(0.0, min(1.0, random.uniform(self.scroll_depth_min, self.scroll_depth_max)))
+            target = max(400, height * depth_frac)
+            steps = max(1, min(10, random.randint(self.scroll_steps_min, self.scroll_steps_max)))
+            for _ in range(steps):
+                await self.page.mouse.wheel(0, target/steps)
+                await think(self.think_cfg["scroll_min_ms"], self.think_cfg["scroll_max_ms"])
+            did_scroll = True
+        finally:
+            await self._special_page_actions(did_scroll)
+
+    async def _special_page_actions(self, did_scroll: bool):
+        if not self.page:
             return
         try:
-            await self.page.wait_for_selector("body", timeout=SEL_TIMEOUT)
+            url = self.page.url
         except Exception:
             return
+        if not url:
+            return
+        path = urlparse(url).path or "/"
+        path_norm = path.rstrip("/") or "/"
+        if path != self._last_special_path:
+            self._last_special_path = path
+            if not self._home_pass_in_progress:
+                self._home_action_done = False
+            if not self._garden_pass_in_progress:
+                self._garden_action_done = False
+        if path_norm == "/":
+            if not self._home_action_done and not self._home_pass_in_progress:
+                self._home_pass_in_progress = True
+                try:
+                    await self._homepage_engagement(did_scroll)
+                finally:
+                    self._home_pass_in_progress = False
+                    self._home_action_done = True
+        elif path_norm == "/garden":
+            if not self._garden_action_done and not self._garden_pass_in_progress:
+                self._garden_pass_in_progress = True
+                try:
+                    await self._garden_page_engagement()
+                finally:
+                    self._garden_pass_in_progress = False
+                    self._garden_action_done = True
+
+    async def _homepage_engagement(self, did_scroll: bool):
+        clicked_hrefs: set[str] = set()
+        orbit_href: Optional[str] = None
+        if random.random() < 0.02:
+            orbit_href = await self._click_homepage_orbit()
+            if orbit_href:
+                clicked_hrefs.add(orbit_href)
+                if random.random() < 0.65:
+                    with contextlib.suppress(Exception):
+                        await self.page.go_back(timeout=ALLOW_NAV_TIMEOUT, wait_until=self.wait_until)
+                        await think(350, 900)
+                        await self._maybe_scroll_page()
+                else:
+                    return
         try:
-            height = await self.page.evaluate("""
-                () => {
-                  const d=document.documentElement,b=document.body;
-                  const vals=[d.scrollHeight,b.scrollHeight,d.offsetHeight,b.offsetHeight,d.clientHeight,b.clientHeight].filter(v=>typeof v==='number');
-                  const h=Math.max(...vals,0); return (h && isFinite(h))?h:2000;
-                }
-            """)
+            hrefs_raw = await self.page.eval_on_selector_all(
+                "a[href*='/products/']",
+                "elements => Array.from(new Set(elements.map(el => el.getAttribute('href')).filter(Boolean)))",
+            )
         except Exception:
-            height = 2000
-        depth_frac = max(0.0, min(1.0, random.uniform(self.scroll_depth_min, self.scroll_depth_max)))
-        target = max(400, height * depth_frac)
-        steps = max(1, min(10, random.randint(self.scroll_steps_min, self.scroll_steps_max)))
-        for _ in range(steps):
-            await self.page.mouse.wheel(0, target/steps)
-            await think(self.think_cfg["scroll_min_ms"], self.think_cfg["scroll_max_ms"])
+            hrefs_raw = []
+        candidates: List[str] = []
+        for href in hrefs_raw:
+            if not isinstance(href, str):
+                continue
+            href_clean = href.strip()
+            if not href_clean or href_clean in clicked_hrefs:
+                continue
+            full = urljoin(self.origin + "/", href_clean)
+            if same_origin(full, self.allowlist):
+                candidates.append(href_clean)
+        if not candidates:
+            return
+        max_clicks_allowed = 3 if did_scroll else 2
+        max_clicks = min(len(candidates), max(1, max_clicks_allowed))
+        desired = random.randint(1, max_clicks)
+        random.shuffle(candidates)
+        clicks = 0
+        for href in candidates:
+            if href in clicked_hrefs:
+                continue
+            success = await self._click_homepage_product_href(href)
+            if not success:
+                continue
+            clicked_hrefs.add(href)
+            clicks += 1
+            if clicks >= desired:
+                break
+            if random.random() < 0.75:
+                try:
+                    await self.page.go_back(timeout=ALLOW_NAV_TIMEOUT, wait_until=self.wait_until)
+                    await think(350, 900)
+                    await self._maybe_scroll_page()
+                except Exception:
+                    break
+            else:
+                break
+
+    async def _garden_page_engagement(self):
+        if random.random() >= 0.5:
+            return
+        locator = self.page.get_by_role("link", name=re.compile("Orbit Terrarium\\s*-\\s*Large", re.I))
+        count = 0
+        try:
+            count = await locator.count()
+        except Exception:
+            count = 0
+        if count == 0:
+            locator = self.page.locator("a[href*='orbit-terrarium-large']")
+            try:
+                count = await locator.count()
+            except Exception:
+                count = 0
+        if count == 0:
+            return
+        target = locator.first
+        try:
+            await target.click(timeout=SEL_TIMEOUT)
+            await self.page.wait_for_load_state(self.wait_until, timeout=ALLOW_NAV_TIMEOUT)
+        except Exception:
+            return
+        await self._maybe_scroll_page()
+        if random.random() < 0.25:
+            await self._add_to_cart()
+
+    async def _click_homepage_orbit(self) -> Optional[str]:
+        selectors = [
+            self.page.get_by_role("link", name=re.compile("Orbit Terrarium\\s*-\\s*Large", re.I)),
+            self.page.locator("a[href*='orbit-terrarium-large']"),
+        ]
+        for loc in selectors:
+            try:
+                count = await loc.count()
+            except Exception:
+                count = 0
+            if count == 0:
+                continue
+            for idx in range(min(count, 3)):
+                candidate = loc.nth(idx)
+                href = ""
+                with contextlib.suppress(Exception):
+                    attr = await candidate.get_attribute("href", timeout=400)
+                    if attr:
+                        href = attr.strip()
+                if not await self._is_locator_in_viewport(candidate):
+                    continue
+                try:
+                    await candidate.click(timeout=SEL_TIMEOUT)
+                    await self.page.wait_for_load_state(self.wait_until, timeout=ALLOW_NAV_TIMEOUT)
+                except Exception:
+                    continue
+                await self._maybe_scroll_page()
+                return href or None
+        return None
+
+    async def _click_homepage_product_href(self, href: str) -> bool:
+        href = href.strip()
+        if not href:
+            return False
+        locators = [
+            self.page.locator(f"a[href='{href}']"),
+        ]
+        absolute = urljoin(self.origin + "/", href)
+        if absolute != href:
+            locators.append(self.page.locator(f"a[href='{absolute}']"))
+        for loc in locators:
+            try:
+                count = await loc.count()
+            except Exception:
+                count = 0
+            if count == 0:
+                continue
+            for idx in range(min(count, 2)):
+                candidate = loc.nth(idx)
+                if not await self._is_locator_in_viewport(candidate):
+                    continue
+                try:
+                    await candidate.click(timeout=SEL_TIMEOUT)
+                    await self.page.wait_for_load_state(self.wait_until, timeout=ALLOW_NAV_TIMEOUT)
+                except Exception:
+                    continue
+                await self._maybe_scroll_page()
+                return True
+        return False
+
+    async def _is_locator_in_viewport(self, locator) -> bool:
+        try:
+            box = await locator.bounding_box()
+            if not box:
+                return False
+            viewport = self.page.viewport_size
+            if viewport and isinstance(viewport, dict) and viewport.get("height"):
+                viewport_height = viewport.get("height", 0) or 0
+            else:
+                viewport_height = await self.page.evaluate("() => window.innerHeight || document.documentElement.clientHeight || 800")
+            scroll_y = await self.page.evaluate("() => window.scrollY || document.documentElement.scrollTop || 0")
+            top = box.get("y", 0)
+            bottom = top + box.get("height", 0)
+            return (top >= scroll_y - 5) and (bottom <= scroll_y + viewport_height + 5)
+        except Exception:
+            return False
+
+    async def _goto_garden_page(self):
+        await self._guarded_goto(f"{self.origin}/garden/")
+        await self._maybe_scroll_page()
 
     async def run(self):
         self.page = None
@@ -355,6 +567,8 @@ class Session:
             await self._start_checkout()
         elif kind == "content_page":
             await self._content_page(step.get("slug",""))
+        elif kind == "goto_garden_page":
+            await self._goto_garden_page()
 
     async def _query_top_nav_links(self) -> List[Tuple[str, any]]:
         selectors = [
