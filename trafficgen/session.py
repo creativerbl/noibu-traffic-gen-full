@@ -7,7 +7,13 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse, urljoin
 
-from trafficgen.utils import think, same_origin, ExponentialBackoff, debug_print
+from trafficgen.utils import (
+    ExponentialBackoff,
+    choose_weighted,
+    debug_print,
+    same_origin,
+    think,
+)
 
 ALLOW_NAV_TIMEOUT = 25000
 SEL_TIMEOUT = 15000
@@ -80,6 +86,18 @@ def _weighted_choice(items: List[str], weights: List[float]) -> Optional[str]:
             return it
     return items[-1]
 
+
+def _prob_to_fraction(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    try:
+        f = float(val)
+    except Exception:
+        return None
+    if f > 1:
+        f = f / 100.0
+    return max(0.0, min(1.0, f))
+
 class Session:
     def __init__(self,
                  session_id: int,
@@ -140,6 +158,15 @@ class Session:
         self.scroll_steps_min = int(os.getenv("SCROLL_STEPS_MIN","2"))
         self.scroll_steps_max = int(os.getenv("SCROLL_STEPS_MAX","6"))
 
+        # Per-step jitter
+        self.step_jitter_pause_min = int(os.getenv("STEP_JITTER_PAUSE_MIN_MS","120"))
+        self.step_jitter_pause_max = int(os.getenv("STEP_JITTER_PAUSE_MAX_MS","600"))
+        self.step_jitter_scroll_prob = float(os.getenv("STEP_JITTER_SCROLL_PROB","0.35"))
+        self.step_jitter_scroll_depth_min = float(os.getenv("STEP_JITTER_SCROLL_DEPTH_MIN","0.08"))
+        self.step_jitter_scroll_depth_max = float(os.getenv("STEP_JITTER_SCROLL_DEPTH_MAX","0.45"))
+        self.step_jitter_scroll_steps_min = int(os.getenv("STEP_JITTER_SCROLL_STEPS_MIN","1"))
+        self.step_jitter_scroll_steps_max = int(os.getenv("STEP_JITTER_SCROLL_STEPS_MAX","3"))
+
         # Top-nav & hotspots
         self.nav_weights = _parse_kv_csv(os.getenv("NAV_CATEGORY_WEIGHTS",""), normalize_keys=True)
         self.nav_hotspot_names = [_normalize_label(x) for x in os.getenv("NAV_HOTSPOT_NAMES","Kitchen,Bath").split(",") if x.strip()]
@@ -195,8 +222,19 @@ class Session:
                 if backoff.attempts > 5:
                     raise
 
-    async def _maybe_scroll_page(self):
-        if random.random() > max(0.0, min(1.0, self.scroll_prob)):
+    async def _maybe_scroll_page(self,
+                                prob: Optional[float] = None,
+                                depth_min: Optional[float] = None,
+                                depth_max: Optional[float] = None,
+                                steps_min: Optional[int] = None,
+                                steps_max: Optional[int] = None):
+        probability = self.scroll_prob if prob is None else prob
+        depth_min = self.scroll_depth_min if depth_min is None else depth_min
+        depth_max = self.scroll_depth_max if depth_max is None else depth_max
+        steps_min = self.scroll_steps_min if steps_min is None else steps_min
+        steps_max = self.scroll_steps_max if steps_max is None else steps_max
+
+        if random.random() > max(0.0, min(1.0, probability)):
             debug_print(self.debug, f"[S{self.id}] no scroll (randomized)")
             return
         try:
@@ -213,9 +251,9 @@ class Session:
             """)
         except Exception:
             height = 2000
-        depth_frac = max(0.0, min(1.0, random.uniform(self.scroll_depth_min, self.scroll_depth_max)))
+        depth_frac = max(0.0, min(1.0, random.uniform(depth_min, depth_max)))
         target = max(400, height * depth_frac)
-        steps = max(1, min(10, random.randint(self.scroll_steps_min, self.scroll_steps_max)))
+        steps = max(1, min(10, random.randint(steps_min, steps_max)))
         for _ in range(steps):
             await self.page.mouse.wheel(0, target/steps)
             await think(self.think_cfg["scroll_min_ms"], self.think_cfg["scroll_max_ms"])
@@ -260,6 +298,11 @@ class Session:
             if self.stop_requested:
                 break
             await self._execute_step(step)
+            if self.stop_requested:
+                break
+            await self._apply_step_jitter()
+            if self.stop_requested:
+                break
             await think(self.think_cfg["page_min_ms"], self.think_cfg["page_max_ms"])
         if (not self.stop_requested) and random.random() < self.coverage_prob:
             await self._coverage_click_pass()
@@ -326,7 +369,45 @@ class Session:
         }
         return default_map.get(slug, f"https://www.{slug}.com/")
 
+    async def _apply_step_jitter(self):
+        pause_ms = random.randint(
+            min(self.step_jitter_pause_min, self.step_jitter_pause_max),
+            max(self.step_jitter_pause_min, self.step_jitter_pause_max),
+        )
+        await asyncio.sleep(pause_ms / 1000.0)
+        await self._maybe_scroll_page(
+            prob=self.step_jitter_scroll_prob,
+            depth_min=self.step_jitter_scroll_depth_min,
+            depth_max=self.step_jitter_scroll_depth_max,
+            steps_min=self.step_jitter_scroll_steps_min,
+            steps_max=self.step_jitter_scroll_steps_max,
+        )
+
+    def _should_run_step(self, step: dict) -> bool:
+        prob = _prob_to_fraction(step.get("probability", step.get("prob")))
+        if prob is None:
+            return True
+        if random.random() <= prob:
+            return True
+        debug_print(self.debug, f"[S{self.id}] skipping step (probability {prob})")
+        return False
+
     async def _execute_step(self, step: dict):
+        if not isinstance(step, dict):
+            return
+        if not self._should_run_step(step):
+            return
+
+        if "choose_one" in step or "choices" in step:
+            await self._execute_choose_one(step)
+            return
+        if "repeat" in step:
+            await self._execute_repeat(step)
+            return
+
+        await self._execute_action(step)
+
+    async def _execute_action(self, step: dict):
         kind = step.get("action")
         if kind == "open_random_category":
             await self._open_random_category()
@@ -342,6 +423,49 @@ class Session:
             await self._start_checkout()
         elif kind == "content_page":
             await self._content_page(step.get("slug",""))
+        elif kind == "exit_session":
+            debug_print(self.debug, f"[S{self.id}] exit_session requested")
+            self.stop_requested = True
+
+    async def _execute_choose_one(self, step: dict):
+        choices = step.get("choose_one") or step.get("choices") or []
+        if not isinstance(choices, list) or not choices:
+            return
+        choice = None
+        if all(isinstance(c, dict) for c in choices):
+            choice = choose_weighted(choices, key="weight")
+        if choice is None:
+            choice = random.choice(choices)
+        if isinstance(choice, dict) and choice.get("steps"):
+            for sub in choice.get("steps", []):
+                if self.stop_requested:
+                    break
+                await self._execute_step(sub)
+        elif isinstance(choice, list):
+            for sub in choice:
+                if self.stop_requested:
+                    break
+                await self._execute_step(sub)
+        elif isinstance(choice, dict):
+            await self._execute_step(choice)
+
+    async def _execute_repeat(self, step: dict):
+        repeat_spec = step.get("repeat")
+        steps = step.get("steps", [])
+        count = 0
+        if isinstance(repeat_spec, int):
+            count = repeat_spec
+        elif isinstance(repeat_spec, dict):
+            count = int(repeat_spec.get("times", repeat_spec.get("count", 1)))
+            steps = repeat_spec.get("steps", steps)
+        count = max(1, min(count or 1, 10))
+        for _ in range(count):
+            if self.stop_requested:
+                break
+            for sub in steps:
+                if self.stop_requested:
+                    break
+                await self._execute_step(sub)
 
     async def _query_top_nav_links(self) -> List[Tuple[str, any]]:
         selectors = [
