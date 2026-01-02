@@ -410,7 +410,11 @@ class Session:
     async def _execute_action(self, step: dict):
         kind = step.get("action")
         if kind == "open_random_category":
-            await self._open_random_category()
+            await self._open_random_category(step)
+        elif kind == "category_explore":
+            await self._category_explore(step)
+        elif kind == "category_hotspot_click":
+            await self._category_hotspot_click(step)
         elif kind == "open_random_pdp":
             await self._open_random_pdp(count=int(step.get("count", 1)))
         elif kind == "home_explore":
@@ -468,6 +472,57 @@ class Session:
                 if self.stop_requested:
                     break
                 await self._execute_step(sub)
+
+    def _extract_category_spec(self, step: Optional[dict]) -> Optional[dict]:
+        if not isinstance(step, dict):
+            return None
+        if "category" in step:
+            val = step.get("category")
+            if isinstance(val, dict):
+                name = val.get("name") or val.get("label")
+                return {"name": name, "url": val.get("url")}
+            if isinstance(val, str) and val.strip():
+                return {"name": val}
+        if isinstance(step.get("category_name"), str) and step.get("category_name", "").strip():
+            return {"name": step.get("category_name")}
+        cats = step.get("categories")
+        if isinstance(cats, list) and cats:
+            choice = None
+            if all(isinstance(c, dict) for c in cats):
+                choice = choose_weighted(cats, key="weight") or cats[0]
+            else:
+                names = [c for c in cats if isinstance(c, str) and c.strip()]
+                if names:
+                    choice = random.choice(names)
+            if isinstance(choice, dict):
+                name = choice.get("name") or choice.get("label")
+                return {"name": name, "url": choice.get("url")}
+            if isinstance(choice, str):
+                return {"name": choice}
+        return None
+
+    def _biased_index(self, total: int, focus: int = 30) -> int:
+        if total <= 1:
+            return 0
+        upper = min(total - 1, max(1, focus))
+        return min(int(random.triangular(0, upper, 0)), total - 1)
+
+    def _match_nav_link(self, links: List[Tuple[str, any]], target_norm: str):
+        for label_norm, el in links:
+            if label_norm == target_norm:
+                return el
+        for label_norm, el in links:
+            if target_norm in label_norm or label_norm in target_norm:
+                return el
+        return None
+
+    def _choose_weighted_nav_link(self, links: List[Tuple[str, any]]):
+        weighted = []
+        for label_norm, el in links:
+            weight = float(self.nav_weights.get(label_norm, 1.0)) if self.nav_weights else 1.0
+            weighted.append({"label": label_norm, "el": el, "weight": weight})
+        choice = choose_weighted(weighted, key="weight") if weighted else None
+        return choice.get("el") if isinstance(choice, dict) else None
 
     async def _query_top_nav_links(self) -> List[Tuple[str, any]]:
         selectors = [
@@ -637,7 +692,39 @@ class Session:
         if random.random() < 0.6:
             await self._maybe_click_home_cta()
 
-    async def _open_random_category(self):
+    async def _open_random_category(self, step: Optional[dict] = None):
+        spec = self._extract_category_spec(step)
+        target_raw = spec.get("name") if isinstance(spec, dict) else ""
+        target_name = _normalize_label(target_raw or "") if isinstance(spec, dict) and spec.get("name") else None
+        target_url = (spec.get("url") or "").strip() if isinstance(spec, dict) else ""
+        if target_url:
+            dest = urljoin(self.origin + "/", target_url)
+            await self._guarded_goto(dest)
+            await self._maybe_scroll_page()
+            return
+
+        links = await self._query_top_nav_links()
+        chosen_el = None
+        if target_name and links:
+            chosen_el = self._match_nav_link(links, target_name)
+        if chosen_el is None and links:
+            chosen_el = self._choose_weighted_nav_link(links)
+        if chosen_el:
+            await self._click_category_element(chosen_el)
+            return
+
+        if target_raw:
+            try:
+                target_candidates = self.page.get_by_role("link", name=re.compile(re.escape(target_raw), re.I))
+                tcount = await target_candidates.count()
+                if tcount > 0:
+                    idx = self._biased_index(tcount, focus=4)
+                    await target_candidates.nth(idx).click(timeout=SEL_TIMEOUT)
+                    await self._maybe_scroll_page()
+                    return
+            except Exception:
+                pass
+
         nav_candidates = self.page.get_by_role("link", name=re.compile("(Shop|All|Kitchen|Bath|Accessories|Sale|New)", re.I))
         count = await nav_candidates.count()
         if count > 0 and random.random() < 0.7:
@@ -645,6 +732,18 @@ class Session:
             await nav_candidates.nth(idx).click(timeout=SEL_TIMEOUT)
         else:
             await self._guarded_goto(f"{self.origin}/categories/")
+        await self._maybe_scroll_page()
+
+    async def _click_category_element(self, el):
+        try:
+            await el.click(timeout=SEL_TIMEOUT)
+        except Exception:
+            try:
+                href = await el.get_attribute("href", timeout=500) or ""
+                if href:
+                    await self._guarded_goto(urljoin(self.origin + "/", href))
+            except Exception:
+                return
         await self._maybe_scroll_page()
 
     async def _open_random_pdp(self, count: int = 1):
@@ -673,25 +772,190 @@ class Session:
             else:
                 break
 
+    async def _apply_category_filters(self, count: int):
+        count = max(0, min(count, 4))
+        if count <= 0:
+            return
+        selectors = [
+            ".facetedSearch-option--checkbox input",
+            "input[type='checkbox'][name*='filter']",
+            ".facetedSearch input[type='checkbox']",
+            "input[type='checkbox']",
+        ]
+        for sel in selectors:
+            loc = self.page.locator(sel)
+            try:
+                total = await loc.count()
+            except Exception:
+                total = 0
+            if total <= 0:
+                continue
+            picks = set()
+            for _ in range(count):
+                if len(picks) >= total:
+                    break
+                attempt = 0
+                idx = None
+                while attempt < 4:
+                    candidate = self._biased_index(total, focus=10)
+                    if candidate not in picks:
+                        idx = candidate
+                        break
+                    attempt += 1
+                if idx is None:
+                    continue
+                picks.add(idx)
+                try:
+                    await loc.nth(idx).check(timeout=SEL_TIMEOUT)
+                    await asyncio.sleep(random.uniform(0.2, 0.8))
+                except Exception:
+                    continue
+            break
+        await self._maybe_scroll_page()
+
+    async def _randomize_category_sort(self):
+        selectors = [
+            "select[name='sort']",
+            "select#sort",
+            "select[name*='Sort']",
+            "select[data-sort]",
+        ]
+        for sel in selectors:
+            dropdown = self.page.locator(sel).first
+            try:
+                options = await dropdown.locator("option").count()
+            except Exception:
+                options = 0
+            if options <= 1:
+                continue
+            try:
+                idx = self._biased_index(options, focus=4)
+                await dropdown.select_option(index=idx, timeout=SEL_TIMEOUT)
+                await self._maybe_scroll_page()
+                return
+            except Exception:
+                continue
+
+    async def _maybe_paginate_category(self) -> bool:
+        if random.random() < 0.4:
+            return False
+        selectors = [
+            "a[rel='next']",
+            "button[aria-label*='next' i]",
+            ".pagination a[aria-label*='next' i]",
+            ".pagination-item--next a",
+        ]
+        for sel in selectors:
+            loc = self.page.locator(sel)
+            try:
+                count = await loc.count()
+            except Exception:
+                count = 0
+            if count <= 0:
+                continue
+            idx = self._biased_index(count, focus=3)
+            try:
+                await loc.nth(idx).click(timeout=SEL_TIMEOUT)
+                await self.page.wait_for_load_state(self.wait_until, timeout=ALLOW_NAV_TIMEOUT)
+                await asyncio.sleep(random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000))
+                await self._maybe_scroll_page()
+                return True
+            except Exception:
+                continue
+        numeric = self.page.locator(".pagination a, nav[aria-label*='pagination' i] a")
+        try:
+            count = await numeric.count()
+        except Exception:
+            count = 0
+        if count <= 0:
+            return False
+        idx = self._biased_index(min(count, 6), focus=3)
+        try:
+            await numeric.nth(idx).click(timeout=SEL_TIMEOUT)
+            await self.page.wait_for_load_state(self.wait_until, timeout=ALLOW_NAV_TIMEOUT)
+            await asyncio.sleep(random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000))
+            await self._maybe_scroll_page()
+            return True
+        except Exception:
+            return False
+
+    async def _click_category_tiles(self, count: int):
+        count = max(1, min(count, 3))
+        visited: set = set()
+        selector = "a.card-figure, a.card-title, a.product-title, a[href*='/products/']"
+        for i in range(count):
+            grid = self.page.locator(selector)
+            try:
+                total = await grid.count()
+            except Exception:
+                total = 0
+            if total <= 0:
+                break
+            choice = None
+            attempts = 0
+            while attempts < 5:
+                idx = self._biased_index(min(total, 40))
+                if idx not in visited:
+                    choice = idx
+                    break
+                attempts += 1
+            if choice is None:
+                choice = 0
+            visited.add(choice)
+            try:
+                await grid.nth(choice).click(timeout=SEL_TIMEOUT)
+                await self._maybe_scroll_page(prob=0.85, depth_min=0.12, depth_max=0.35, steps_min=1, steps_max=3)
+            except Exception:
+                continue
+            if i < count - 1:
+                with contextlib.suppress(Exception):
+                    await self.page.go_back(timeout=ALLOW_NAV_TIMEOUT, wait_until=self.wait_until)
+                    await asyncio.sleep(random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000))
+                    await self._maybe_scroll_page(prob=0.65, depth_min=0.08, depth_max=0.22, steps_min=1, steps_max=2)
+
+    async def _category_explore(self, step: dict):
+        await self._open_random_category(step)
+        if self.stop_requested:
+            return
+        filters_to_apply = random.randint(0, 2)
+        if filters_to_apply > 0:
+            await self._apply_category_filters(filters_to_apply)
+        await self._randomize_category_sort()
+        await self._maybe_paginate_category()
+        await self._click_category_tiles(random.randint(1, 3))
+
+    async def _category_hotspot_click(self, step: dict):
+        if any(k in (step or {}) for k in ("category", "categories", "category_name")):
+            await self._open_random_category(step)
+        selectors = [
+            ".category-hero a, .category-hero button, .collection-hero a, .collection-hero button",
+            ".category-banner a, .category-banner button, .collection-banner a, .collection-banner button",
+            ".category-promo a, .category-promo button, .promo-banner a, .promo-tile a, .promo a",
+        ]
+        for sel in selectors:
+            loc = self.page.locator(sel)
+            try:
+                count = await loc.count()
+            except Exception:
+                count = 0
+            if count <= 0:
+                continue
+            idx = self._biased_index(min(count, 6), focus=4)
+            try:
+                await loc.nth(idx).click(timeout=SEL_TIMEOUT)
+                await self._maybe_scroll_page(prob=0.75, depth_min=0.18, depth_max=0.4, steps_min=1, steps_max=3)
+                return
+            except Exception:
+                continue
+        await self._maybe_scroll_page(prob=0.4, depth_min=0.1, depth_max=0.3, steps_min=1, steps_max=2)
+
     async def _sort_or_filter(self):
         sort_prob = float(os.getenv("CATEGORY_SORT_PROB","0.30"))
         filter_prob = float(os.getenv("CATEGORY_FILTER_PROB","0.15"))
         if random.random() < sort_prob:
-            try:
-                sel = self.page.locator("select[name='sort'], select#sort, select[name*='Sort']")
-                await sel.first.select_option(index=random.randint(0, 2), timeout=SEL_TIMEOUT)
-            except Exception:
-                pass
-            await self._maybe_scroll_page()
+            await self._randomize_category_sort()
         if random.random() < filter_prob:
-            try:
-                filt = self.page.locator("input[type='checkbox'], .facetedSearch-option--checkbox input")
-                if await filt.count() > 0:
-                    await filt.nth(0).check(timeout=SEL_TIMEOUT)
-                    await asyncio.sleep(0.5)
-            except Exception:
-                pass
-            await self._maybe_scroll_page()
+            await self._apply_category_filters(1)
 
     async def _add_to_cart(self):
         if self.did_add_to_cart >= self.funnel_max_cart_adds:
