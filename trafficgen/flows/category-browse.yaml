@@ -1,6 +1,7 @@
 type: scripted
 name: "category-browse"
 steps:
+  - action: home_explore
   - action: open_random_category
   - action: sort_or_filter
   - action: open_random_pdp
