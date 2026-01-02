@@ -1,6 +1,7 @@
 type: scripted
 name: "add-to-cart→checkout-start"
 steps:
+  - action: home_explore
   - action: open_random_category
   - action: open_random_pdp
   - action: add_to_cart

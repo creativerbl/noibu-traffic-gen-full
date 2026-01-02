@@ -413,6 +413,8 @@ class Session:
             await self._open_random_category()
         elif kind == "open_random_pdp":
             await self._open_random_pdp(count=int(step.get("count", 1)))
+        elif kind == "home_explore":
+            await self._home_explore()
         elif kind == "sort_or_filter":
             await self._sort_or_filter()
         elif kind == "add_to_cart":
@@ -555,6 +557,85 @@ class Session:
     async def _category_micro_behaviors(self):
         await self._sort_or_filter()
         await self._open_random_pdp(count=random.randint(1, 2))
+
+    def _home_scroll_depth(self) -> float:
+        buckets = [
+            {"depth": 0.20, "weight": 18},
+            {"depth": 0.50, "weight": 40},
+            {"depth": 0.80, "weight": 28},
+            {"depth": 1.00, "weight": 14},
+        ]
+        choice = choose_weighted(buckets, key="weight") or {"depth": 0.5}
+        jitter = random.uniform(-0.06, 0.08)
+        return max(0.05, min(1.1, float(choice.get("depth", 0.5)) + jitter))
+
+    async def _scroll_to_depth(self, depth: float):
+        try:
+            await self.page.wait_for_selector("body", timeout=SEL_TIMEOUT)
+        except Exception:
+            return
+        try:
+            metrics = await self.page.evaluate("""
+                () => {
+                  const d=document.documentElement,b=document.body;
+                  const vals=[d.scrollHeight,b.scrollHeight,d.offsetHeight,b.offsetHeight,d.clientHeight,b.clientHeight].filter(v=>typeof v==='number');
+                  const height=Math.max(...vals,0)||2000;
+                  return {height, y: window.scrollY || 0};
+                }
+            """)
+        except Exception:
+            metrics = {"height": 2000, "y": 0}
+        target = max(400, metrics.get("height", 2000) * depth)
+        current = float(metrics.get("y", 0) or 0.0)
+        delta = target - current
+        steps = max(1, min(8, random.randint(2, 5)))
+        distance = delta / steps if steps else delta
+        for _ in range(steps):
+            await self.page.mouse.wheel(0, distance)
+            await think(self.think_cfg["scroll_min_ms"], self.think_cfg["scroll_max_ms"])
+
+    async def _maybe_click_home_cta(self) -> bool:
+        selectors = [
+            ".hero a, .hero button, .hero-cta a, .hero-cta button, .banner a, .banner button, .jumbotron a, .jumbotron button",
+            ".featured-products a, .featured-collection a, .featured a, .featured-collections a",
+        ]
+        if random.random() > 0.55:
+            return False
+        for sel in selectors:
+            loc = self.page.locator(sel)
+            try:
+                count = await loc.count()
+            except Exception:
+                count = 0
+            if count <= 0:
+                continue
+            idx = random.randint(0, min(count - 1, 3))
+            try:
+                await loc.nth(idx).click(timeout=SEL_TIMEOUT)
+                await self._maybe_scroll_page(
+                    prob=0.65,
+                    depth_min=0.12,
+                    depth_max=0.35,
+                    steps_min=1,
+                    steps_max=3,
+                )
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _home_explore(self):
+        await self._guarded_goto(self.origin + "/")
+        segments = random.randint(1, 3)
+        last_depth = 0.0
+        for i in range(segments):
+            target_depth = self._home_scroll_depth()
+            if i > 0 and random.random() < 0.35:
+                target_depth = max(0.05, last_depth - random.uniform(0.08, 0.3))
+            await self._scroll_to_depth(target_depth)
+            last_depth = target_depth
+        if random.random() < 0.6:
+            await self._maybe_click_home_cta()
 
     async def _open_random_category(self):
         nav_candidates = self.page.get_by_role("link", name=re.compile("(Shop|All|Kitchen|Bath|Accessories|Sale|New)", re.I))
