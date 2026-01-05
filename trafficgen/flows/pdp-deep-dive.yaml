@@ -3,5 +3,11 @@ name: "pdp-deep-dive"
 steps:
   - action: home_explore
   - action: category_explore
-  - action: open_random_pdp
-  - action: open_random_pdp
+  - repeat:
+      times: 2
+      steps:
+        - action: open_random_pdp
+        - action: pdp_explore
+        - action: pdp_decision
+          add_to_cart_weight: 0.65
+          bounce_weight: 1.0

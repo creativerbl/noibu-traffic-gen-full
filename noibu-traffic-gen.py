@@ -93,8 +93,11 @@ def main():
         timezones=["America/Toronto","America/New_York","America/Vancouver","Europe/London"],
         flows=[{"type":"scripted","steps":[
             {"action":"open_random_category"},
-            {"action":"open_random_pdp","count":2},
-            {"action":"add_to_cart"},
+            {"repeat":{"times":2,"steps":[
+                {"action":"open_random_pdp"},
+                {"action":"pdp_explore"},
+                {"action":"pdp_decision","add_to_cart_weight":0.7,"bounce_weight":1.0},
+            ]}},
             {"action":"view_cart"},
             {"action":"start_checkout"},
         ]}],
