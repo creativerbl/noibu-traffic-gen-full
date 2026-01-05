@@ -1,5 +1,6 @@
 type: scripted
 name: "pdp-deep-dive"
+weight: 25
 steps:
   - action: home_explore
   - action: category_explore

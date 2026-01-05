@@ -1,8 +1,10 @@
 type: scripted
 name: "add-to-cart→checkout-start"
+weight: 20
 steps:
   - action: home_explore
   - action: category_explore
   - action: add_to_cart
   - action: view_cart
-  - action: start_checkout
+  - action: cart_edit
+  - action: checkout_start

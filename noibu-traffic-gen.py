@@ -1,8 +1,10 @@
 
 # noibu-traffic-gen.py — Chromium-only runner with .env-driven referrers & devices
 import os, asyncio, math
+from pathlib import Path
 from dotenv import load_dotenv  # 👈 ensure .env is loaded into process env
 from trafficgen.runner import Runner, RunnerConfig
+from trafficgen.utils import load_yaml_files
 
 # Load .env from the current working directory (repo root)
 # Set override=False so exported shell vars still take precedence if set.
@@ -32,6 +34,12 @@ def _normalize_to_100(weights):
         idx = fracs[i % len(fracs)][0]
         floored[idx] += 1
     return floored
+
+def _load_flows_from_disk() -> list:
+    flow_dir = Path(__file__).parent / "trafficgen" / "flows"
+    flow_files = sorted(flow_dir.glob("*.yaml"))
+    flows = load_yaml_files([str(p) for p in flow_files])
+    return [f for f in flows if f]
 
 def build_referrers_from_env():
     sources = [s for s in _parse_csv(os.getenv("REFERRER_SOURCES", "")) if s and s.strip()]
@@ -78,6 +86,18 @@ def main():
     sessions_per_min = float(os.getenv("SESSIONS_PER_MINUTE", "25"))
     avg_session_min  = float(os.getenv("AVG_SESSION_MINUTES", "1"))
     checkout_rate    = float(os.getenv("CHECKOUT_COMPLETE_RATE", "0.30"))
+    flows = _load_flows_from_disk()
+    if not flows:
+        flows = [{"type":"scripted","steps":[
+            {"action":"open_random_category"},
+            {"repeat":{"times":2,"steps":[
+                {"action":"open_random_pdp"},
+                {"action":"pdp_explore"},
+                {"action":"pdp_decision","add_to_cart_weight":0.7,"bounce_weight":1.0},
+            ]}},
+            {"action":"view_cart"},
+            {"action":"start_checkout"},
+        ]}]
 
     cfg = RunnerConfig(
         origin=origin,
@@ -91,16 +111,7 @@ def main():
         device_mix=build_device_mix_from_env(),
         locales=["en-US","en-CA","en-GB","fr-CA"],
         timezones=["America/Toronto","America/New_York","America/Vancouver","Europe/London"],
-        flows=[{"type":"scripted","steps":[
-            {"action":"open_random_category"},
-            {"repeat":{"times":2,"steps":[
-                {"action":"open_random_pdp"},
-                {"action":"pdp_explore"},
-                {"action":"pdp_decision","add_to_cart_weight":0.7,"bounce_weight":1.0},
-            ]}},
-            {"action":"view_cart"},
-            {"action":"start_checkout"},
-        ]}],
+        flows=flows,
         think_times={"page_min_ms":800,"page_max_ms":2200,"scroll_min_ms":200,"scroll_max_ms":700},
         smoke=False,
         debug=True,

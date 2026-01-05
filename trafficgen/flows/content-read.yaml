@@ -1,5 +1,6 @@
 type: scripted
 name: "content-read"
+weight: 20
 steps:
   - action: home_explore
   - { action: content_page, slug: "/shipping-returns/" }
