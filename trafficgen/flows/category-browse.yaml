@@ -1,5 +1,6 @@
 type: scripted
 name: "category-browse"
+weight: 20
 steps:
   - action: home_explore
   - action: category_explore

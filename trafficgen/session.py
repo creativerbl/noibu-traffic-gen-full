@@ -202,6 +202,13 @@ class Session:
         self.context = await self.browser.new_context(**cargs)
         self.page = await self.context.new_page()
 
+    def _pick_flow(self) -> Optional[dict]:
+        if not self.flows:
+            return None
+        if any(isinstance(f, dict) and "weight" in f for f in self.flows):
+            return choose_weighted(self.flows, key="weight") or self.flows[0]
+        return random.choice(self.flows)
+
     async def _guarded_goto(self, url: str, referer: Optional[str] = None):
         if not same_origin(url, self.allowlist):
             return
@@ -278,7 +285,7 @@ class Session:
                 raise last_exc
             raise RuntimeError("browser context creation failed")
         try:
-            flow = random.choice(self.flows or [{}])
+            flow = self._pick_flow()
             if not flow:
                 return
             await self._run_scripted(flow)
@@ -429,8 +436,12 @@ class Session:
             await self._pdp_decision(step)
         elif kind == "view_cart":
             await self._view_cart()
+        elif kind == "cart_edit":
+            await self._cart_edit(step)
         elif kind == "start_checkout":
             await self._start_checkout()
+        elif kind == "checkout_start":
+            await self._checkout_start()
         elif kind == "content_page":
             await self._content_page(step.get("slug",""))
         elif kind == "exit_session":
@@ -1164,6 +1175,58 @@ class Session:
             await self._guarded_goto(f"{self.origin}/cart.php")
         await self._maybe_scroll_page()
 
+    async def _cart_edit(self, step: Optional[dict] = None):
+        remove_prob = float((step or {}).get("remove_prob", 0.18))
+        try:
+            items = self.page.locator(".cart-item, [data-cart-item], tr.cart-item")
+            count = await items.count()
+        except Exception:
+            count = 0
+        if count <= 0:
+            return
+        target_idx = self._biased_index(min(count, 6), focus=4)
+        row = items.nth(target_idx)
+        qty_locators = row.locator("input[name*='qty'], input[name='qty[]'], input[type='number']")
+        try:
+            qty_count = await qty_locators.count()
+        except Exception:
+            qty_count = 0
+        if qty_count > 0:
+            qty_input = qty_locators.first
+            try:
+                current_val = await qty_input.input_value(timeout=800)
+            except Exception:
+                current_val = ""
+            try:
+                new_qty = random.randint(1, 3)
+                if str(current_val).isdigit():
+                    if int(current_val) == new_qty and new_qty < 3:
+                        new_qty += 1
+                await qty_input.fill(str(new_qty), timeout=SEL_TIMEOUT)
+                with contextlib.suppress(Exception):
+                    await qty_input.press("Enter", timeout=SEL_TIMEOUT)
+                await asyncio.sleep(random.uniform(0.2, 0.6))
+            except Exception:
+                pass
+        if random.random() < max(0.0, min(1.0, remove_prob)):
+            selectors = [
+                "button[aria-label*='remove']",
+                "button[name='action'][value='delete']",
+                "button[name='delete']",
+                "button:has-text('Remove')",
+                "a:has-text('Remove')",
+                "a.cart-remove",
+            ]
+            for sel in selectors:
+                target = row.locator(sel)
+                try:
+                    if await target.count() > 0:
+                        await target.first.click(timeout=SEL_TIMEOUT)
+                        break
+                except Exception:
+                    continue
+        await self._maybe_scroll_page(prob=0.4, depth_min=0.08, depth_max=0.2, steps_min=1, steps_max=2)
+
     async def _start_checkout(self):
         if self.did_start_checkout >= self.funnel_max_checkout_starts:
             return
@@ -1178,6 +1241,12 @@ class Session:
             except Exception:
                 return
         await self._maybe_scroll_page()
+
+    async def _checkout_start(self):
+        await self._start_checkout()
+        if self.did_start_checkout:
+            debug_print(self.debug, f"[S{self.id}] checkout_start requested; ending session after checkout entry")
+            self.stop_requested = True
 
     async def _content_page(self, slug: str):
         slugs = ["/contact-us/","/shipping-returns/","/blog/","/help/"]
