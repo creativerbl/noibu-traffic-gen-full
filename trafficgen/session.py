@@ -423,6 +423,10 @@ class Session:
             await self._sort_or_filter()
         elif kind == "add_to_cart":
             await self._add_to_cart()
+        elif kind == "pdp_explore":
+            await self._pdp_explore(step)
+        elif kind == "pdp_decision":
+            await self._pdp_decision(step)
         elif kind == "view_cart":
             await self._view_cart()
         elif kind == "start_checkout":
@@ -973,6 +977,184 @@ class Session:
         except Exception:
             return
         await think(500, 1200)
+
+    async def _pdp_view_media(self):
+        selectors = [
+            ".productView-thumbnail img",
+            ".productView-thumbnails img",
+            ".productView-image--thumb img",
+            ".productView img",
+            "[data-image-gallery] img",
+        ]
+        for sel in selectors:
+            loc = self.page.locator(sel)
+            try:
+                total = await loc.count()
+            except Exception:
+                total = 0
+            if total <= 0:
+                continue
+            taps = random.randint(1, min(3, total))
+            visited = set()
+            for _ in range(taps):
+                idx = self._biased_index(min(total, 12), focus=4)
+                if idx in visited:
+                    continue
+                visited.add(idx)
+                with contextlib.suppress(Exception):
+                    await loc.nth(idx).click(timeout=SEL_TIMEOUT)
+                    await asyncio.sleep(random.uniform(0.15, 0.5))
+            break
+        try:
+            zoom_btns = self.page.get_by_role("button", name=re.compile("zoom", re.I))
+            zcount = await zoom_btns.count()
+        except Exception:
+            zcount = 0
+        if zcount > 0 and random.random() < 0.55:
+            idx = self._biased_index(min(zcount, 4), focus=2)
+            with contextlib.suppress(Exception):
+                await zoom_btns.nth(idx).click(timeout=SEL_TIMEOUT)
+                await asyncio.sleep(random.uniform(0.3, 0.9))
+                await self.page.keyboard.press("Escape")
+
+    async def _pdp_select_variant(self):
+        dropdowns = [
+            "form select[name*='option']",
+            "form select[id*='option']",
+            "form select[name*='attribute']",
+            "form select",
+        ]
+        for sel in dropdowns:
+            loc = self.page.locator(sel)
+            try:
+                total = await loc.count()
+            except Exception:
+                total = 0
+            if total <= 0:
+                continue
+            for i in range(total):
+                dropdown = loc.nth(i)
+                try:
+                    opts = await dropdown.locator("option").count()
+                except Exception:
+                    opts = 0
+                if opts <= 1:
+                    continue
+                try:
+                    idx = random.randint(1, opts - 1)
+                    await dropdown.select_option(index=idx, timeout=SEL_TIMEOUT)
+                    await asyncio.sleep(random.uniform(0.2, 0.5))
+                except Exception:
+                    continue
+                return
+        radio_selectors = [
+            "input[type='radio'][name*='option']",
+            ".form-radio input[type='radio']",
+            "input[type='radio'][name*='attribute']",
+        ]
+        for sel in radio_selectors:
+            loc = self.page.locator(sel)
+            try:
+                total = await loc.count()
+            except Exception:
+                total = 0
+            if total <= 0:
+                continue
+            idx = self._biased_index(min(total, 12), focus=5)
+            with contextlib.suppress(Exception):
+                await loc.nth(idx).check(timeout=SEL_TIMEOUT)
+                await asyncio.sleep(random.uniform(0.2, 0.5))
+                return
+
+    async def _pdp_scroll_to_reviews_or_description(self):
+        candidates: List[Any] = []
+        try:
+            links = self.page.get_by_role("link", name=re.compile("(review|rating|description|details|specs)", re.I))
+            lcount = await links.count()
+            for i in range(min(lcount, 5)):
+                candidates.append(links.nth(i))
+        except Exception:
+            pass
+        selectors = [
+            "#tab-description, #description, [id*='Description']",
+            "#tab-reviews, #reviews, [id*='Review']",
+            ".productView-description, .productView-details",
+        ]
+        for sel in selectors:
+            loc = self.page.locator(sel)
+            try:
+                count = await loc.count()
+            except Exception:
+                count = 0
+            if count > 0:
+                candidates.append(loc.first)
+        for target in candidates:
+            with contextlib.suppress(Exception):
+                await target.scroll_into_view_if_needed(timeout=SEL_TIMEOUT)
+                await self._maybe_scroll_page(
+                    prob=0.95,
+                    depth_min=0.18,
+                    depth_max=0.45,
+                    steps_min=1,
+                    steps_max=3,
+                )
+                return
+        await self._scroll_to_depth(random.uniform(0.35, 0.8))
+
+    async def _pdp_click_related_product(self):
+        selectors = [
+            "section.related-products a",
+            "[data-related-products] a",
+            "[data-recommended-products] a",
+            ".productRelated a",
+            ".upsell-products a",
+        ]
+        for sel in selectors:
+            loc = self.page.locator(sel)
+            try:
+                total = await loc.count()
+            except Exception:
+                total = 0
+            if total <= 0:
+                continue
+            idx = self._biased_index(min(total, 10), focus=4)
+            el = loc.nth(idx)
+            try:
+                await el.scroll_into_view_if_needed(timeout=SEL_TIMEOUT)
+                await asyncio.sleep(random.uniform(0.1, 0.3))
+                await el.click(timeout=SEL_TIMEOUT)
+                await self._maybe_scroll_page(
+                    prob=0.8,
+                    depth_min=0.1,
+                    depth_max=0.3,
+                    steps_min=1,
+                    steps_max=2,
+                )
+                return
+            except Exception:
+                continue
+
+    async def _pdp_explore(self, step: Optional[dict] = None):
+        await self._pdp_view_media()
+        await self._pdp_select_variant()
+        await self._pdp_scroll_to_reviews_or_description()
+        related_prob = float((step or {}).get("related_click_prob", 0.35))
+        if random.random() < max(0.0, min(1.0, related_prob)):
+            await self._pdp_click_related_product()
+
+    async def _pdp_decision(self, step: Optional[dict] = None):
+        step = step or {}
+        outcomes = [
+            {"outcome": "add_to_cart", "weight": float(step.get("add_to_cart_weight", step.get("add_weight", 0.6)) or 0.0)},
+            {"outcome": "bounce", "weight": float(step.get("bounce_weight", 1.0) or 0.0)},
+        ]
+        choice = choose_weighted(outcomes, key="weight") or outcomes[0]
+        outcome = (choice or {}).get("outcome", "bounce")
+        if outcome == "add_to_cart":
+            await self._add_to_cart()
+        else:
+            debug_print(self.debug, f"[S{self.id}] pdp_decision → bounce (ending session)")
+            self.stop_requested = True
 
     async def _view_cart(self):
         try:
