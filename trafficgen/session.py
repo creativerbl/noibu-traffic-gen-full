@@ -442,8 +442,12 @@ class Session:
             await self._start_checkout()
         elif kind == "checkout_start":
             await self._checkout_start()
+        elif kind == "content_browse":
+            await self._content_browse(step)
         elif kind == "content_page":
             await self._content_page(step.get("slug",""))
+        elif kind == "footer_explore":
+            await self._footer_explore(step)
         elif kind == "exit_session":
             debug_print(self.debug, f"[S{self.id}] exit_session requested")
             self.stop_requested = True
@@ -1254,6 +1258,44 @@ class Session:
             slugs.insert(0, slug)
         await self._guarded_goto(self.origin + random.choice(slugs))
         await self._maybe_scroll_page()
+
+    async def _content_browse(self, step: Optional[dict] = None):
+        pages = step.get("pages") if isinstance(step, dict) else None
+        if not isinstance(pages, list) or not pages:
+            pages = ["/about-us/", "/contact-us/", "/shipping-returns/", "/blog/", "/help/"]
+        unique_pages = [p for p in pages if isinstance(p, str) and p.startswith("/")]
+        random.shuffle(unique_pages)
+        visit_count = random.randint(1, min(2, max(1, len(unique_pages))))
+        for slug in unique_pages[:visit_count]:
+            if self.stop_requested:
+                break
+            await self._content_page(slug)
+
+    async def _footer_explore(self, step: Optional[dict] = None):
+        try:
+            await self._scroll_to_depth(1.05)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await self.page.mouse.wheel(0, 2000)
+        selectors = step.get("selectors") if isinstance(step, dict) else None
+        if not isinstance(selectors, list) or not selectors:
+            selectors = ["footer a[href]", "footer nav a[href]", "footer li a[href]"]
+        for sel in selectors:
+            loc = self.page.locator(sel)
+            try:
+                count = await loc.count()
+            except Exception:
+                count = 0
+            if count <= 0:
+                continue
+            idx = random.randint(0, min(count - 1, 8))
+            try:
+                await loc.nth(idx).click(timeout=SEL_TIMEOUT)
+                await self._maybe_scroll_page(prob=0.6, depth_min=0.15, depth_max=0.4, steps_min=1, steps_max=3)
+                return
+            except Exception:
+                continue
+        await self._maybe_scroll_page(prob=0.4, depth_min=0.05, depth_max=0.15, steps_min=1, steps_max=2)
 
     async def _coverage_click_pass(self):
         try:
