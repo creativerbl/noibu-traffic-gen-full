@@ -191,6 +191,12 @@ class Session:
         self.did_start_checkout = 0
         self.stop_requested = False
 
+        # Search
+        self.search_terms = _parse_list_csv(os.getenv(
+            "SEARCH_TERMS",
+            "faucet,sink,shower,towel,mirror,lighting,vanity,fixture,soap,kitchen,bathroom,storage,rug,mat",
+        )) or ["sale", "new", "gift"]
+
         self.page = None
         self.context = None
 
@@ -444,6 +450,10 @@ class Session:
             await self._checkout_start()
         elif kind == "content_page":
             await self._content_page(step.get("slug",""))
+        elif kind == "search":
+            await self._search(step)
+        elif kind == "search_result_explore":
+            await self._search_result_explore()
         elif kind == "exit_session":
             debug_print(self.debug, f"[S{self.id}] exit_session requested")
             self.stop_requested = True
@@ -706,6 +716,133 @@ class Session:
             last_depth = target_depth
         if random.random() < 0.6:
             await self._maybe_click_home_cta()
+
+    def _pick_search_term(self, step: Optional[dict]) -> str:
+        if isinstance(step, dict):
+            terms_spec = step.get("terms")
+            if isinstance(terms_spec, list) and terms_spec:
+                if all(isinstance(t, dict) for t in terms_spec):
+                    weighted = []
+                    for t in terms_spec:
+                        term_val = t.get("term") or t.get("value") or t.get("text")
+                        if term_val:
+                            weighted.append({"term": str(term_val), "weight": float(t.get("weight", 1.0) or 0.0)})
+                    choice = choose_weighted(weighted, key="weight") if weighted else None
+                    if isinstance(choice, dict) and choice.get("term"):
+                        return str(choice["term"])
+                else:
+                    str_terms = [str(t) for t in terms_spec if str(t).strip()]
+                    if str_terms:
+                        return random.choice(str_terms)
+        return random.choice(self.search_terms)
+
+    async def _find_search_input(self):
+        selectors = [
+            "input[type='search']",
+            "input[name*='search' i]",
+            "input[placeholder*='search' i]",
+            "input[aria-label*='search' i]",
+            "form[role='search'] input",
+            "form[action*='search' i] input",
+        ]
+        for sel in selectors:
+            loc = self.page.locator(sel)
+            try:
+                count = await loc.count()
+            except Exception:
+                count = 0
+            if count <= 0:
+                continue
+            for i in range(min(count, 3)):
+                candidate = loc.nth(i)
+                try:
+                    if await candidate.is_visible(timeout=SEL_TIMEOUT):
+                        return candidate
+                except Exception:
+                    continue
+        toggles = [
+            "button[aria-label*='search' i]",
+            "button:has-text('Search')",
+            "a[aria-label*='search' i]",
+            "a[href*='search']",
+        ]
+        for sel in toggles:
+            toggle = self.page.locator(sel).first
+            try:
+                if await toggle.is_visible(timeout=SEL_TIMEOUT):
+                    await toggle.click(timeout=SEL_TIMEOUT)
+                    break
+            except Exception:
+                continue
+        for sel in selectors:
+            loc = self.page.locator(sel)
+            try:
+                count = await loc.count()
+            except Exception:
+                count = 0
+            if count <= 0:
+                continue
+            for i in range(min(count, 3)):
+                candidate = loc.nth(i)
+                try:
+                    if await candidate.is_visible(timeout=SEL_TIMEOUT):
+                        return candidate
+                except Exception:
+                    continue
+        return None
+
+    async def _submit_search_form(self, input_el):
+        if input_el is None:
+            return
+        try:
+            await input_el.press("Enter", timeout=SEL_TIMEOUT)
+            return
+        except Exception:
+            pass
+        try:
+            form = input_el.locator("xpath=ancestor::form[1]")
+            buttons = form.locator("button[type='submit'],input[type='submit']")
+            if await buttons.count() > 0:
+                await buttons.first.click(timeout=SEL_TIMEOUT)
+                return
+        except Exception:
+            pass
+        try:
+            buttons = self.page.locator("button[aria-label*='search' i],button[type='submit'][name*='search' i]")
+            if await buttons.count() > 0:
+                await buttons.first.click(timeout=SEL_TIMEOUT)
+        except Exception:
+            return
+
+    async def _search(self, step: Optional[dict] = None):
+        term = self._pick_search_term(step)
+        input_el = await self._find_search_input()
+        if input_el is None:
+            debug_print(self.debug, f"[S{self.id}] search input not found")
+            return
+        try:
+            await input_el.click(timeout=SEL_TIMEOUT)
+            await input_el.fill(term, timeout=SEL_TIMEOUT)
+            debug_print(self.debug, f"[S{self.id}] search → '{term}'")
+        except Exception as exc:
+            debug_print(self.debug, f"[S{self.id}] search fill failed: {exc}")
+            return
+        await self._submit_search_form(input_el)
+        with contextlib.suppress(Exception):
+            await self.page.wait_for_load_state(self.wait_until, timeout=ALLOW_NAV_TIMEOUT)
+            await asyncio.sleep(random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000))
+        await self._maybe_scroll_page(prob=0.85, depth_min=0.12, depth_max=0.32, steps_min=1, steps_max=3)
+
+    async def _search_result_explore(self):
+        await self._maybe_scroll_page(prob=0.95, depth_min=0.18, depth_max=0.45, steps_min=1, steps_max=3)
+        branch = random.random()
+        if branch < 0.6:
+            await self._click_category_tiles(random.randint(1, 2))
+        else:
+            await self._apply_category_filters(random.randint(1, 2))
+            await self._maybe_scroll_page(prob=0.75, depth_min=0.1, depth_max=0.35, steps_min=1, steps_max=3)
+            if random.random() < 0.35:
+                await self._randomize_category_sort()
 
     async def _open_random_category(self, step: Optional[dict] = None):
         spec = self._extract_category_spec(step)

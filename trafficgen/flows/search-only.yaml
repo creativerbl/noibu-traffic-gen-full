@@ -1,0 +1,7 @@
+type: scripted
+name: "search-only"
+weight: 12
+steps:
+  - action: home_explore
+  - action: search
+  - action: search_result_explore
