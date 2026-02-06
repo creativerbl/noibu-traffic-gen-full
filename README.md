@@ -84,6 +84,13 @@ FUNNEL_ADD_TO_CART_RATE=0.30         # ~30% add to cart
 FUNNEL_CHECKOUT_START_RATE=0.50      # ~50% of ATC sessions start checkout
 ```
 
+### 🎯 Flows
+Each flow YAML in `trafficgen/flows/*.yaml` can include a `weight` to bias selection.
+
+| Variable | Purpose |
+| --- | --- |
+| `FLOW_WEIGHTS` | Optional overrides for flow weights (by flow `name`), e.g., `category-browse:40,checkout-complete:10`. |
+
 ---
 
 ## ▶️ What to expect in logs
