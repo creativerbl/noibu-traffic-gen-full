@@ -70,6 +70,16 @@ def _parse_prob_csv(env_val: str) -> Dict[str, float]:
             pass
     return out
 
+def _parse_weight_overrides(env_val: str) -> Dict[str, float]:
+    raw = _parse_kv_csv(env_val, normalize_keys=True)
+    out: Dict[str, float] = {}
+    for k, v in raw.items():
+        try:
+            out[k] = max(float(v), 0.0)
+        except Exception:
+            continue
+    return out
+
 def _weighted_choice(items: List[str], weights: List[float]) -> Optional[str]:
     if not items:
         return None
@@ -131,6 +141,7 @@ class Session:
         self.global_qps = global_qps
         self.debug = debug
         self.fault_profile = fault_profile or {}
+        self.flow_weight_overrides = _parse_weight_overrides(os.getenv("FLOW_WEIGHTS", ""))
 
         # UTM source (legacy env choice supplied by Runner)
         self.referrer_url = (referrer_url or "").strip() or None
@@ -190,6 +201,8 @@ class Session:
         self.did_add_to_cart = 0
         self.did_start_checkout = 0
         self.stop_requested = False
+        self._apply_flow_weight_overrides()
+        self._flow_weights_available = any(isinstance(f, dict) and "weight" in f for f in self.flows)
 
         self.page = None
         self.context = None
@@ -202,10 +215,22 @@ class Session:
         self.context = await self.browser.new_context(**cargs)
         self.page = await self.context.new_page()
 
+    def _apply_flow_weight_overrides(self):
+        if not self.flow_weight_overrides:
+            return
+        for f in self.flows:
+            if not isinstance(f, dict):
+                continue
+            name = _normalize_label(f.get("name") or "")
+            if not name:
+                continue
+            if name in self.flow_weight_overrides:
+                f["weight"] = self.flow_weight_overrides[name]
+
     def _pick_flow(self) -> Optional[dict]:
         if not self.flows:
             return None
-        if any(isinstance(f, dict) and "weight" in f for f in self.flows):
+        if self._flow_weights_available:
             return choose_weighted(self.flows, key="weight") or self.flows[0]
         return random.choice(self.flows)
 
