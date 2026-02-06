@@ -8,11 +8,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse, urljoin
 
 from trafficgen.utils import (
+    biased_index,
     ExponentialBackoff,
     choose_weighted,
     debug_print,
     same_origin,
     think,
+    weighted_value,
 )
 
 ALLOW_NAV_TIMEOUT = 25000
@@ -169,6 +171,13 @@ class Session:
         self.scroll_steps_min = int(os.getenv("SCROLL_STEPS_MIN","2"))
         self.scroll_steps_max = int(os.getenv("SCROLL_STEPS_MAX","6"))
 
+        # Post-load pauses
+        self.micro_pause_min_ms = int(os.getenv("PAGE_MICRO_PAUSE_MIN_MS","90"))
+        self.micro_pause_max_ms = int(os.getenv("PAGE_MICRO_PAUSE_MAX_MS","280"))
+        self.idle_after_page_prob = float(os.getenv("PAGE_IDLE_PROB","0.14"))
+        self.idle_after_page_min_ms = int(os.getenv("PAGE_IDLE_MIN_MS","1400"))
+        self.idle_after_page_max_ms = int(os.getenv("PAGE_IDLE_MAX_MS","5200"))
+
         # Per-step jitter
         self.step_jitter_pause_min = int(os.getenv("STEP_JITTER_PAUSE_MIN_MS","120"))
         self.step_jitter_pause_max = int(os.getenv("STEP_JITTER_PAUSE_MAX_MS","600"))
@@ -177,6 +186,13 @@ class Session:
         self.step_jitter_scroll_depth_max = float(os.getenv("STEP_JITTER_SCROLL_DEPTH_MAX","0.45"))
         self.step_jitter_scroll_steps_min = int(os.getenv("STEP_JITTER_SCROLL_STEPS_MIN","1"))
         self.step_jitter_scroll_steps_max = int(os.getenv("STEP_JITTER_SCROLL_STEPS_MAX","3"))
+
+        # Tile hover heatmaps
+        self.tile_hover_prob = float(os.getenv("CATEGORY_TILE_HOVER_PROB","0.6"))
+        self.tile_hover_count_min = int(os.getenv("CATEGORY_TILE_HOVER_MIN","2"))
+        self.tile_hover_count_max = int(os.getenv("CATEGORY_TILE_HOVER_MAX","5"))
+        self.tile_hover_dwell_min_ms = int(os.getenv("CATEGORY_TILE_HOVER_DWELL_MIN_MS","160"))
+        self.tile_hover_dwell_max_ms = int(os.getenv("CATEGORY_TILE_HOVER_DWELL_MAX_MS","520"))
 
         # Top-nav & hotspots
         self.nav_weights = _parse_kv_csv(os.getenv("NAV_CATEGORY_WEIGHTS",""), normalize_keys=True)
@@ -254,11 +270,26 @@ class Session:
                     referer=referer,
                 )
                 await asyncio.sleep(random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000))
+                await self._post_load_idle_pause()
                 return
             except Exception:
                 await backoff.wait()
                 if backoff.attempts > 5:
                     raise
+
+    async def _post_load_idle_pause(self):
+        pause_ms = random.randint(
+            min(self.micro_pause_min_ms, self.micro_pause_max_ms),
+            max(self.micro_pause_min_ms, self.micro_pause_max_ms),
+        )
+        await asyncio.sleep(pause_ms / 1000.0)
+        if random.random() < max(0.0, min(1.0, self.idle_after_page_prob)):
+            idle_ms = random.randint(
+                min(self.idle_after_page_min_ms, self.idle_after_page_max_ms),
+                max(self.idle_after_page_min_ms, self.idle_after_page_max_ms),
+            )
+            debug_print(self.debug, f"[S{self.id}] idle after load for {idle_ms}ms")
+            await asyncio.sleep(idle_ms / 1000.0)
 
     async def _maybe_scroll_page(self,
                                 prob: Optional[float] = None,
@@ -553,12 +584,6 @@ class Session:
                 return {"name": choice}
         return None
 
-    def _biased_index(self, total: int, focus: int = 30) -> int:
-        if total <= 1:
-            return 0
-        upper = min(total - 1, max(1, focus))
-        return min(int(random.triangular(0, upper, 0)), total - 1)
-
     def _match_nav_link(self, links: List[Tuple[str, any]], target_norm: str):
         for label_norm, el in links:
             if label_norm == target_norm:
@@ -672,9 +697,19 @@ class Session:
             {"depth": 0.80, "weight": 28},
             {"depth": 1.00, "weight": 14},
         ]
-        choice = choose_weighted(buckets, key="weight") or {"depth": 0.5}
-        jitter = random.uniform(-0.06, 0.08)
-        return max(0.05, min(1.1, float(choice.get("depth", 0.5)) + jitter))
+        depth = weighted_value(
+            buckets,
+            value_key="depth",
+            weight_key="weight",
+            default=0.5,
+            jitter=(-0.06, 0.08),
+            clamp_min=0.05,
+            clamp_max=1.1,
+        )
+        try:
+            return float(depth)
+        except Exception:
+            return 0.5
 
     async def _scroll_to_depth(self, depth: float):
         try:
@@ -897,7 +932,7 @@ class Session:
                 target_candidates = self.page.get_by_role("link", name=re.compile(re.escape(target_raw), re.I))
                 tcount = await target_candidates.count()
                 if tcount > 0:
-                    idx = self._biased_index(tcount, focus=4)
+                    idx = biased_index(tcount, focus=4)
                     await target_candidates.nth(idx).click(timeout=SEL_TIMEOUT)
                     await self._maybe_scroll_page()
                     return
@@ -976,7 +1011,7 @@ class Session:
                 attempt = 0
                 idx = None
                 while attempt < 4:
-                    candidate = self._biased_index(total, focus=10)
+                    candidate = biased_index(total, focus=10)
                     if candidate not in picks:
                         idx = candidate
                         break
@@ -1008,7 +1043,7 @@ class Session:
             if options <= 1:
                 continue
             try:
-                idx = self._biased_index(options, focus=4)
+                idx = biased_index(options, focus=4)
                 await dropdown.select_option(index=idx, timeout=SEL_TIMEOUT)
                 await self._maybe_scroll_page()
                 return
@@ -1032,11 +1067,12 @@ class Session:
                 count = 0
             if count <= 0:
                 continue
-            idx = self._biased_index(count, focus=3)
+            idx = biased_index(count, focus=3)
             try:
                 await loc.nth(idx).click(timeout=SEL_TIMEOUT)
                 await self.page.wait_for_load_state(self.wait_until, timeout=ALLOW_NAV_TIMEOUT)
                 await asyncio.sleep(random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000))
+                await self._post_load_idle_pause()
                 await self._maybe_scroll_page()
                 return True
             except Exception:
@@ -1048,15 +1084,41 @@ class Session:
             count = 0
         if count <= 0:
             return False
-        idx = self._biased_index(min(count, 6), focus=3)
+        idx = biased_index(min(count, 6), focus=3)
         try:
             await numeric.nth(idx).click(timeout=SEL_TIMEOUT)
             await self.page.wait_for_load_state(self.wait_until, timeout=ALLOW_NAV_TIMEOUT)
             await asyncio.sleep(random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000))
+            await self._post_load_idle_pause()
             await self._maybe_scroll_page()
             return True
         except Exception:
             return False
+
+    async def _hover_category_tiles(self, count: int):
+        count = max(1, min(count, 8))
+        selector = "a.card-figure, a.card-title, a.product-title, a[href*='/products/']"
+        grid = self.page.locator(selector)
+        try:
+            total = await grid.count()
+        except Exception:
+            total = 0
+        if total <= 0:
+            return
+        seen: set = set()
+        dwell_min = min(self.tile_hover_dwell_min_ms, self.tile_hover_dwell_max_ms)
+        dwell_max = max(self.tile_hover_dwell_min_ms, self.tile_hover_dwell_max_ms)
+        for _ in range(count):
+            idx = biased_index(min(total, 60), focus=8)
+            if idx in seen:
+                continue
+            seen.add(idx)
+            try:
+                el = grid.nth(idx)
+                await el.hover(timeout=SEL_TIMEOUT)
+                await asyncio.sleep(random.uniform(dwell_min/1000, dwell_max/1000))
+            except Exception:
+                continue
 
     async def _click_category_tiles(self, count: int):
         count = max(1, min(count, 3))
@@ -1073,7 +1135,7 @@ class Session:
             choice = None
             attempts = 0
             while attempts < 5:
-                idx = self._biased_index(min(total, 40))
+                idx = biased_index(min(total, 40))
                 if idx not in visited:
                     choice = idx
                     break
@@ -1090,6 +1152,7 @@ class Session:
                 with contextlib.suppress(Exception):
                     await self.page.go_back(timeout=ALLOW_NAV_TIMEOUT, wait_until=self.wait_until)
                     await asyncio.sleep(random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000))
+                    await self._post_load_idle_pause()
                     await self._maybe_scroll_page(prob=0.65, depth_min=0.08, depth_max=0.22, steps_min=1, steps_max=2)
 
     async def _category_explore(self, step: dict):
@@ -1101,6 +1164,12 @@ class Session:
             await self._apply_category_filters(filters_to_apply)
         await self._randomize_category_sort()
         await self._maybe_paginate_category()
+        hover_count = random.randint(
+            min(self.tile_hover_count_min, self.tile_hover_count_max),
+            max(self.tile_hover_count_min, self.tile_hover_count_max),
+        )
+        if random.random() < max(0.0, min(1.0, self.tile_hover_prob)):
+            await self._hover_category_tiles(hover_count)
         await self._click_category_tiles(random.randint(1, 3))
 
     async def _category_hotspot_click(self, step: dict):
@@ -1119,7 +1188,7 @@ class Session:
                 count = 0
             if count <= 0:
                 continue
-            idx = self._biased_index(min(count, 6), focus=4)
+            idx = biased_index(min(count, 6), focus=4)
             try:
                 await loc.nth(idx).click(timeout=SEL_TIMEOUT)
                 await self._maybe_scroll_page(prob=0.75, depth_min=0.18, depth_max=0.4, steps_min=1, steps_max=3)
@@ -1172,7 +1241,7 @@ class Session:
             taps = random.randint(1, min(3, total))
             visited = set()
             for _ in range(taps):
-                idx = self._biased_index(min(total, 12), focus=4)
+                idx = biased_index(min(total, 12), focus=4)
                 if idx in visited:
                     continue
                 visited.add(idx)
@@ -1186,7 +1255,7 @@ class Session:
         except Exception:
             zcount = 0
         if zcount > 0 and random.random() < 0.55:
-            idx = self._biased_index(min(zcount, 4), focus=2)
+            idx = biased_index(min(zcount, 4), focus=2)
             with contextlib.suppress(Exception):
                 await zoom_btns.nth(idx).click(timeout=SEL_TIMEOUT)
                 await asyncio.sleep(random.uniform(0.3, 0.9))
@@ -1235,7 +1304,7 @@ class Session:
                 total = 0
             if total <= 0:
                 continue
-            idx = self._biased_index(min(total, 12), focus=5)
+            idx = biased_index(min(total, 12), focus=5)
             with contextlib.suppress(Exception):
                 await loc.nth(idx).check(timeout=SEL_TIMEOUT)
                 await asyncio.sleep(random.uniform(0.2, 0.5))
@@ -1292,7 +1361,7 @@ class Session:
                 total = 0
             if total <= 0:
                 continue
-            idx = self._biased_index(min(total, 10), focus=4)
+            idx = biased_index(min(total, 10), focus=4)
             el = loc.nth(idx)
             try:
                 await el.scroll_into_view_if_needed(timeout=SEL_TIMEOUT)
@@ -1348,7 +1417,7 @@ class Session:
             count = 0
         if count <= 0:
             return
-        target_idx = self._biased_index(min(count, 6), focus=4)
+        target_idx = biased_index(min(count, 6), focus=4)
         row = items.nth(target_idx)
         qty_locators = row.locator("input[name*='qty'], input[name='qty[]'], input[type='number']")
         try:

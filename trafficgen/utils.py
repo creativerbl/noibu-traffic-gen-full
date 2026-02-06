@@ -106,3 +106,45 @@ def choose_weighted(items: List[dict], key: str = "weight") -> Optional[dict]:
             return item
         upto += w
     return items[-1]
+
+
+def weighted_value(
+    buckets: List[dict],
+    value_key: str = "value",
+    weight_key: str = "weight",
+    default: Any = None,
+    jitter: Optional[tuple] = None,
+    clamp_min: Optional[float] = None,
+    clamp_max: Optional[float] = None,
+) -> Any:
+    """
+    Choose a value from a bucket list with weights and optional jitter/clamping.
+
+    Each bucket is a dict with at least `value_key` and `weight_key`. If no valid
+    buckets exist, `default` is returned.
+    """
+    choice = choose_weighted(buckets, key=weight_key) if buckets else None
+    if not isinstance(choice, dict):
+        return default
+    val = choice.get(value_key, default)
+    if isinstance(val, (int, float)) and jitter:
+        try:
+            val = float(val) + random.uniform(jitter[0], jitter[1])
+        except Exception:
+            pass
+    if isinstance(val, (int, float)):
+        if clamp_min is not None:
+            val = max(clamp_min, val)
+        if clamp_max is not None:
+            val = min(clamp_max, val)
+    return val
+
+
+def biased_index(total: int, focus: int = 30, clamp: Optional[int] = None) -> int:
+    """Return a biased index toward the top of a list/grid."""
+    if total <= 1:
+        return 0
+    capped_total = min(total, clamp) if clamp is not None else total
+    upper = min(capped_total - 1, max(1, focus))
+    pick = int(random.triangular(0, upper, 0))
+    return min(max(pick, 0), total - 1)
