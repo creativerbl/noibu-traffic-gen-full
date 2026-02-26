@@ -19,8 +19,8 @@ A realistic web traffic simulation tool for generating synthetic user sessions o
 > The repo ships with a helper script. Make it executable and run it.
 
 ```bash
-chmod +x ./noibu-traffic-gen.sh
-./noibu-traffic-gen.sh
+chmod +x ./run_with_venv.sh 
+./run_with_venv.sh 
 ```
 
 
