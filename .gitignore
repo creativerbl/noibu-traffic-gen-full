@@ -13,5 +13,9 @@ __pycache__/
 .vscode/
 .idea/
 
+# Debug output
+debug_*.png
+debug_*.json
+
 # Misc
 *.patch

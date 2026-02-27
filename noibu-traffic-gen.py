@@ -14,6 +14,7 @@ import signal
 import string
 import sys
 import time
+import json
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PwTimeout
@@ -24,7 +25,7 @@ load_dotenv()
 ORIGIN = os.getenv("ORIGIN", "https://noibudemo.com")
 PRODUCT_PATH = os.getenv("PRODUCT_PATH", "/orbit-terrarium-large/")
 MIN_INTERVAL_S = int(os.getenv("MIN_INTERVAL_SECONDS", "60"))
-HEADLESS = os.getenv("HEADLESS", "1") == "1"
+HEADLESS = os.getenv("HEADLESS", "0") == "1"
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
 # Card details
@@ -200,6 +201,43 @@ async def scroll_down(page, steps: int = 3, step_px: int = 300):
     for _ in range(steps):
         await page.mouse.wheel(0, step_px + random.randint(-50, 100))
         await asyncio.sleep(random.uniform(0.3, 0.8))
+
+
+async def dump_page_debug(page, label: str):
+    """Save screenshot + HTML dump for debugging."""
+    try:
+        safe = label.replace(" ", "_").replace("#", "")
+        await page.screenshot(path=f"debug_{safe}.png", full_page=True)
+        log(f"  Screenshot saved: debug_{safe}.png")
+
+        # Dump all visible input/select/button/label/iframe elements
+        elements = await page.evaluate("""() => {
+            const results = [];
+            const sels = 'input,select,button,label,iframe,a[href*="checkout"],a[href*="cart"],.form-checklist-item,[data-test],[class*="payment"],[class*="credit"],[id*="cc"],[id*="card"]';
+            document.querySelectorAll(sels).forEach(el => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    results.push({
+                        tag: el.tagName.toLowerCase(),
+                        id: el.id || '',
+                        name: el.getAttribute('name') || '',
+                        type: el.getAttribute('type') || '',
+                        class: el.className ? el.className.toString().slice(0, 100) : '',
+                        dataTest: el.getAttribute('data-test') || '',
+                        text: el.textContent ? el.textContent.trim().slice(0, 80) : '',
+                        value: el.value ? el.value.slice(0, 40) : '',
+                        href: el.getAttribute('href') || '',
+                        src: el.getAttribute('src') || '',
+                    });
+                }
+            });
+            return results;
+        }""")
+        with open(f"debug_{safe}_elements.json", "w") as f:
+            json.dump(elements, f, indent=2)
+        log(f"  Element dump saved: debug_{safe}_elements.json ({len(elements)} elements)")
+    except Exception as e:
+        log(f"  Debug dump failed: {e}")
 
 
 # ── main flow ────────────────────────────────────────────────────────────────
@@ -453,134 +491,198 @@ async def run_order(browser, order_num: int) -> bool:
         # ── Step 7: Select test payment provider ──
         log(f"[Order #{order_num}] Step 7: Selecting payment method")
 
-        # Look for "Test Payment Provider" option
-        test_payment = page.locator(
-            'label:has-text("Test Payment"), '
-            'input[value*="test"], '
-            '[data-test="payment-method-radio"]:has-text("Test"), '
-            '.form-checklist-item:has-text("Test Payment Provider")'
-        ).first
+        # Debug: capture the payment section state
+        await dump_page_debug(page, f"order{order_num}_payment_step")
 
-        try:
-            await test_payment.wait_for(state="visible", timeout=10_000)
-            await test_payment.click()
-            await human_delay(1, 2)
-            dbg("Selected test payment provider")
-        except PwTimeout:
-            dbg("Test payment provider radio not found, may be auto-selected")
+        # Also dump iframe info
+        frames = page.frames
+        for i, frame in enumerate(frames):
+            url = frame.url
+            if url and url != "about:blank":
+                dbg(f"Frame[{i}]: name={frame.name!r} url={url}")
+
+        # Look for "Test Payment Provider" option - try multiple approaches
+        payment_selected = False
+        # Approach 1: Look for a radio/label with text matching test payment
+        for selector in [
+            'label:has-text("Test Payment")',
+            'label:has-text("Test Gateway")',
+            '.form-checklist-item:has-text("Test")',
+            '[data-test*="payment"] label',
+            'input[type="radio"][name*="payment"]',
+            '.checkout-step--payment label',
+            '#checkout-payment-continue',
+        ]:
+            try:
+                el = page.locator(selector).first
+                if await el.is_visible(timeout=2_000):
+                    await el.click()
+                    payment_selected = True
+                    dbg(f"Selected payment via: {selector}")
+                    await human_delay(1, 2)
+                    break
+            except Exception:
+                continue
+
+        if not payment_selected:
+            dbg("No payment method radio found, may be auto-selected or single option")
 
         # ── Step 8: Enter card details ──
         log(f"[Order #{order_num}] Step 8: Entering card details")
+        await human_delay(1, 2)
 
-        # Card number - may be in an iframe (common for PCI-compliant gateways)
-        # Try direct input first, then iframe
+        # Debug: capture state after payment selection
+        await dump_page_debug(page, f"order{order_num}_card_entry_step")
+
         card_filled = False
 
-        # Attempt 1: Direct inputs (test payment providers often use plain inputs)
-        try:
-            cc_input = page.locator(
-                '#ccNumber, '
-                'input[name="ccNumber"], '
-                'input[data-test="credit-card-number-input"], '
-                'input[name="credit_card_number"], '
-                'input[id*="ccNumber"]'
-            ).first
-            await cc_input.wait_for(state="visible", timeout=8_000)
-            await cc_input.click()
-            await slow_type(cc_input, CARD_NUMBER)
-            await human_delay(0.3, 0.7)
+        # Attempt 1: Direct inputs on the main page (BigCommerce test provider)
+        CC_NUMBER_SELECTORS = [
+            '#ccNumber', 'input[name="ccNumber"]',
+            'input[data-test="credit-card-number-input"]',
+            'input[name="credit_card_number"]',
+            'input[id*="ccNumber"]', 'input[id*="cardNumber"]',
+            'input[autocomplete="cc-number"]',
+            'input[placeholder*="Card Number"]',
+            'input[placeholder*="card number"]',
+        ]
+        CC_EXPIRY_SELECTORS = [
+            '#ccExpiry', 'input[name="ccExpiry"]',
+            'input[data-test="credit-card-expiry-input"]',
+            'input[name="expiration"]',
+            'input[id*="ccExpiry"]', 'input[id*="cardExpiry"]',
+            'input[autocomplete="cc-exp"]',
+            'input[placeholder*="MM"]',
+        ]
+        CC_CVV_SELECTORS = [
+            '#ccCvv', 'input[name="ccCvv"]',
+            'input[data-test="credit-card-cvv-input"]',
+            'input[name="cvv"]', 'input[name="cvc"]',
+            'input[id*="ccCvv"]', 'input[id*="cardCvv"]',
+            'input[autocomplete="cc-csc"]',
+            'input[placeholder*="CVV"]',
+        ]
+        CC_NAME_SELECTORS = [
+            '#ccName', 'input[name="ccName"]',
+            'input[data-test="credit-card-name-input"]',
+            'input[id*="ccName"]',
+            'input[autocomplete="cc-name"]',
+            'input[placeholder*="Name on"]',
+        ]
 
-            # Expiry
-            exp_input = page.locator(
-                '#ccExpiry, '
-                'input[name="ccExpiry"], '
-                'input[data-test="credit-card-expiry-input"], '
-                'input[name="expiration"], '
-                'input[id*="ccExpiry"]'
-            ).first
-            await exp_input.click()
-            await slow_type(exp_input, CARD_EXPIRY)
-            await human_delay(0.3, 0.7)
+        async def find_and_fill(selectors_list, value, label="field"):
+            """Try each selector until one works."""
+            for sel in selectors_list:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.is_visible(timeout=1_500):
+                        await loc.click()
+                        await loc.fill("")
+                        await slow_type(loc, value)
+                        await human_delay(0.3, 0.7)
+                        dbg(f"Filled {label} via: {sel}")
+                        return True
+                except Exception:
+                    continue
+            return False
 
-            # CVV
-            cvv_input = page.locator(
-                '#ccCvv, '
-                'input[name="ccCvv"], '
-                'input[data-test="credit-card-cvv-input"], '
-                'input[name="cvv"], '
-                'input[id*="ccCvv"]'
-            ).first
-            await cvv_input.click()
-            await slow_type(cvv_input, CARD_CVV)
-            await human_delay(0.3, 0.7)
-
-            # Name on card (if present)
-            try:
-                name_input = page.locator(
-                    '#ccName, '
-                    'input[name="ccName"], '
-                    'input[data-test="credit-card-name-input"], '
-                    'input[id*="ccName"]'
-                ).first
-                if await name_input.is_visible():
-                    await name_input.click()
-                    full_name = f"{identity['first_name']} {identity['last_name']}"
-                    await slow_type(name_input, full_name)
-                    await human_delay(0.3, 0.7)
-            except Exception:
-                pass
-
+        # Try direct inputs on the page
+        cc_ok = await find_and_fill(CC_NUMBER_SELECTORS, CARD_NUMBER, "card number")
+        if cc_ok:
+            await find_and_fill(CC_EXPIRY_SELECTORS, CARD_EXPIRY, "expiry")
+            await find_and_fill(CC_CVV_SELECTORS, CARD_CVV, "cvv")
+            full_name = f"{identity['first_name']} {identity['last_name']}"
+            await find_and_fill(CC_NAME_SELECTORS, full_name, "name on card")
             card_filled = True
-            dbg("Filled card details via direct inputs")
-        except PwTimeout:
-            dbg("Direct card inputs not found, trying iframes")
+            dbg("Filled card details via direct page inputs")
 
-        # Attempt 2: Iframe-based card inputs
+        # Attempt 2: Look inside iframes
         if not card_filled:
-            try:
-                frames = page.frames
-                for frame in frames:
-                    cc_in_frame = frame.locator('input[name="cardnumber"], input[id*="card-number"]').first
-                    try:
-                        if await cc_in_frame.is_visible():
-                            await cc_in_frame.click()
-                            await slow_type(cc_in_frame, CARD_NUMBER)
+            dbg(f"Checking {len(page.frames)} frames for card inputs...")
+            for i, frame in enumerate(page.frames):
+                if frame == page.main_frame:
+                    continue
+                dbg(f"  Checking frame[{i}]: name={frame.name!r} url={frame.url}")
+                try:
+                    for sel in ['input[name="cardnumber"]', 'input[id*="card-number"]',
+                                'input[name="credit-card-number"]', 'input[autocomplete="cc-number"]',
+                                'input[placeholder*="Card"]']:
+                        cc_in_frame = frame.locator(sel).first
+                        try:
+                            if await cc_in_frame.is_visible(timeout=2_000):
+                                await cc_in_frame.click()
+                                await slow_type(cc_in_frame, CARD_NUMBER)
 
-                            exp_in_frame = frame.locator('input[name="exp-date"], input[id*="expiry"]').first
-                            await exp_in_frame.click()
-                            await slow_type(exp_in_frame, CARD_EXPIRY)
+                                # Find expiry in same frame
+                                for exp_sel in ['input[name="exp-date"]', 'input[name="expiry"]',
+                                                'input[autocomplete="cc-exp"]', 'input[placeholder*="MM"]']:
+                                    exp_f = frame.locator(exp_sel).first
+                                    try:
+                                        if await exp_f.is_visible(timeout=1_000):
+                                            await exp_f.click()
+                                            await slow_type(exp_f, CARD_EXPIRY)
+                                            break
+                                    except Exception:
+                                        continue
 
-                            cvv_in_frame = frame.locator('input[name="cvc"], input[id*="cvv"]').first
-                            await cvv_in_frame.click()
-                            await slow_type(cvv_in_frame, CARD_CVV)
+                                # Find CVV in same frame
+                                for cvv_sel in ['input[name="cvc"]', 'input[name="cvv"]',
+                                                'input[autocomplete="cc-csc"]', 'input[placeholder*="CVV"]']:
+                                    cvv_f = frame.locator(cvv_sel).first
+                                    try:
+                                        if await cvv_f.is_visible(timeout=1_000):
+                                            await cvv_f.click()
+                                            await slow_type(cvv_f, CARD_CVV)
+                                            break
+                                    except Exception:
+                                        continue
 
-                            card_filled = True
-                            dbg("Filled card details via iframe")
-                            break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+                                card_filled = True
+                                dbg(f"Filled card details via iframe[{i}]")
+                                break
+                        except Exception:
+                            continue
+                    if card_filled:
+                        break
+                except Exception as e:
+                    dbg(f"  Frame[{i}] error: {e}")
 
         if not card_filled:
             log(f"[Order #{order_num}] WARNING: Could not find card input fields")
+            await dump_page_debug(page, f"order{order_num}_card_FAILED")
 
         await human_delay(1, 2)
-        log(f"[Order #{order_num}] Step 8: Card details entered")
+        log(f"[Order #{order_num}] Step 8: Card details {'entered' if card_filled else 'FAILED'}")
 
         # ── Step 9: Place order ──
         log(f"[Order #{order_num}] Step 9: Placing order")
-        place_order_btn = page.locator(
-            '#checkout-payment-continue, '
-            'button[data-test="place-order-button"], '
-            'button:has-text("Place Order"), '
-            'input[value="Place Order"], '
-            '#checkout-payment-continue'
-        ).first
 
-        await place_order_btn.wait_for(state="visible", timeout=10_000)
-        await human_delay(0.5, 1.5)
-        await place_order_btn.click()
+        PLACE_ORDER_SELECTORS = [
+            '#checkout-payment-continue',
+            'button[data-test="place-order-button"]',
+            'button:has-text("Place Order")',
+            'input[value="Place Order"]',
+            'button:has-text("Complete Order")',
+            'button:has-text("Submit Order")',
+            '.checkout-step--payment button[type="submit"]',
+        ]
+
+        order_clicked = False
+        for sel in PLACE_ORDER_SELECTORS:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=3_000):
+                    await human_delay(0.5, 1.5)
+                    await btn.click()
+                    order_clicked = True
+                    dbg(f"Clicked place order via: {sel}")
+                    break
+            except Exception:
+                continue
+
+        if not order_clicked:
+            log(f"[Order #{order_num}] WARNING: Could not find Place Order button")
+            await dump_page_debug(page, f"order{order_num}_placeorder_FAILED")
 
         # Wait for order confirmation
         await human_delay(5, 8)
@@ -636,7 +738,10 @@ async def main():
     async with async_playwright() as pw:
         while not shutdown.is_set():
             # Launch fresh browser for each order (resilience + fingerprint rotation)
-            browser = await pw.chromium.launch(headless=HEADLESS)
+            launch_opts = {"headless": HEADLESS}
+            if not HEADLESS:
+                launch_opts["slow_mo"] = 100  # 100ms delay between actions for visibility
+            browser = await pw.chromium.launch(**launch_opts)
             order_num += 1
             cycle_start = time.monotonic()
 
