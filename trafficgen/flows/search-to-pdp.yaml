@@ -1,0 +1,12 @@
+type: scripted
+name: "search→pdp"
+weight: 15
+steps:
+  - action: home_explore
+  - action: search
+  - action: search_result_explore
+  - action: open_random_pdp
+  - action: pdp_explore
+  - action: pdp_decision
+    add_to_cart_weight: 0.6
+    bounce_weight: 1.0
