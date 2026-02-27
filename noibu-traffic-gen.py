@@ -549,7 +549,7 @@ async def run_order(browser, order_num: int) -> bool:
 
         # Attempt 1: Direct inputs on the main page (BigCommerce test provider)
         CC_NUMBER_SELECTORS = [
-            '#ccNumber', 'input[name="ccNumber"]',
+            '#ccNumber', '#card-number', 'input[name="ccNumber"]',
             'input[data-test="credit-card-number-input"]',
             'input[name="credit_card_number"]',
             'input[id*="ccNumber"]', 'input[id*="cardNumber"]',
@@ -608,71 +608,71 @@ async def run_order(browser, order_num: int) -> bool:
             dbg("Filled card details via direct page inputs")
 
         # Attempt 2: Look inside iframes
-        # BigCommerce hosted payment uses SEPARATE iframes per field,
-        # so we must search across ALL iframes for each field individually.
+        # BigCommerce hosted payment uses SEPARATE iframes per field.
+        # Each iframe has ONE visible input (the real field) plus hidden
+        # autocomplete trap inputs (tabindex="-1", opacity:0). We must
+        # find the visible input in each iframe and identify it by its
+        # attributes (id, autocomplete, aria-label, placeholder).
         if not card_filled:
             full_name = f"{identity['first_name']} {identity['last_name']}"
             non_main_frames = [f for f in page.frames if f != page.main_frame]
             dbg(f"Checking {len(non_main_frames)} child frames for card inputs...")
 
-            # Define what to look for in each field category
-            iframe_field_map = [
-                ("card number", CARD_NUMBER, [
-                    'input[name="cardnumber"]', 'input[id*="card-number"]',
-                    'input[name="credit-card-number"]', 'input[autocomplete="cc-number"]',
-                    'input[placeholder*="Card Number"]', 'input[placeholder*="card number"]',
-                    'input[id*="ccNumber"]', 'input[data-test="credit-card-number-input"]',
-                    'input',  # last resort: only input in the frame
-                ]),
-                ("expiry", CARD_EXPIRY, [
-                    'input[name="exp-date"]', 'input[name="expiry"]',
-                    'input[autocomplete="cc-exp"]', 'input[placeholder*="MM"]',
-                    'input[placeholder*="Expir"]', 'input[id*="ccExpiry"]',
-                    'input[data-test="credit-card-expiry-input"]',
-                    'input',
-                ]),
-                ("name on card", full_name, [
-                    'input[name="ccName"]', 'input[autocomplete="cc-name"]',
-                    'input[placeholder*="Name"]', 'input[id*="ccName"]',
-                    'input[data-test="credit-card-name-input"]',
-                    'input',
-                ]),
-                ("cvv", CARD_CVV, [
-                    'input[name="cvc"]', 'input[name="cvv"]',
-                    'input[autocomplete="cc-csc"]', 'input[placeholder*="CVV"]',
-                    'input[placeholder*="CVC"]', 'input[id*="ccCvv"]',
-                    'input[data-test="credit-card-cvv-input"]',
-                    'input',
-                ]),
-            ]
-
             fields_filled = 0
-            used_frames = set()  # track which frames we already filled
+            field_values = {
+                "card number": CARD_NUMBER,
+                "expiry": CARD_EXPIRY,
+                "cvv": CARD_CVV,
+                "name on card": full_name,
+            }
+            filled_fields = set()
 
-            for label, value, selectors in iframe_field_map:
-                filled_this = False
-                for frame in non_main_frames:
-                    if id(frame) in used_frames:
-                        continue
-                    for sel in selectors:
-                        try:
-                            loc = frame.locator(sel).first
-                            if await loc.is_visible(timeout=2_000):
-                                await loc.click()
-                                await loc.fill("")
-                                await slow_type(loc, value)
-                                await human_delay(0.3, 0.6)
-                                used_frames.add(id(frame))
-                                fields_filled += 1
-                                filled_this = True
-                                dbg(f"  Filled {label} in frame url={frame.url[:80]}")
-                                break
-                        except Exception:
+            for frame in non_main_frames:
+                try:
+                    # Find the PRIMARY visible input — skip hidden autocomplete traps
+                    visible_input = frame.locator(
+                        'input:not([tabindex="-1"]):not([type="hidden"])'
+                    ).first
+                    try:
+                        if not await visible_input.is_visible(timeout=2_000):
                             continue
-                    if filled_this:
-                        break
-                if not filled_this:
-                    dbg(f"  Could not find {label} in any iframe")
+                    except Exception:
+                        continue
+
+                    # Read attributes to identify which field this is
+                    autocomplete = (await visible_input.get_attribute("autocomplete") or "").lower()
+                    input_id = (await visible_input.get_attribute("id") or "").lower()
+                    aria_label = (await visible_input.get_attribute("aria-label") or "").lower()
+                    placeholder = (await visible_input.get_attribute("placeholder") or "").lower()
+                    ident = f"{autocomplete} {input_id} {aria_label} {placeholder}"
+                    dbg(f"  Frame visible input: id={input_id!r} autocomplete={autocomplete!r} aria-label={aria_label!r}")
+
+                    if any(k in ident for k in ["cc-number", "card-number", "card number", "credit card"]):
+                        field_key = "card number"
+                    elif any(k in ident for k in ["cc-exp", "expir", "card-expiry"]):
+                        field_key = "expiry"
+                    elif any(k in ident for k in ["cc-csc", "cvv", "cvc", "card-code", "security code"]):
+                        field_key = "cvv"
+                    elif any(k in ident for k in ["cc-name", "card-name", "cardholder", "name on"]):
+                        field_key = "name on card"
+                    else:
+                        dbg(f"  Unknown field, skipping: {ident}")
+                        continue
+
+                    if field_key in filled_fields:
+                        continue
+
+                    value = field_values[field_key]
+                    await visible_input.click()
+                    await visible_input.fill("")
+                    await slow_type(visible_input, value)
+                    await human_delay(0.3, 0.6)
+                    filled_fields.add(field_key)
+                    fields_filled += 1
+                    dbg(f"  Filled {field_key} in frame (id={input_id!r})")
+
+                except Exception as e:
+                    dbg(f"  Frame error: {e}")
 
             if fields_filled >= 3:  # card number + expiry + cvv at minimum
                 card_filled = True
