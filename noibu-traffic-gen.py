@@ -407,30 +407,8 @@ async def run_order(browser, order_num: int) -> bool:
             identity["city"]
         )
 
-        # State/Province - handle as dropdown or input
-        state_select = page.locator(
-            '#provinceCodeInput, '
-            'select[name="stateOrProvince"], '
-            'select[data-test="provinceCodeInput"], '
-            'select[name="stateOrProvinceCode"]'
-        ).first
-        try:
-            await state_select.wait_for(state="visible", timeout=5_000)
-            await state_select.select_option(value=identity["state"])
-            await human_delay(0.3, 0.7)
-        except (PwTimeout, Exception):
-            # Try as text input
-            await fill_field(
-                '#provinceInput, input[name="stateOrProvince"]',
-                identity["state"]
-            )
-
-        await fill_field(
-            '#postCodeInput, input[name="postalCode"], input[data-test="postCodeInput"]',
-            identity["zip"]
-        )
-
-        # Country - select United States
+        # Country MUST be selected before State (BigCommerce renders
+        # the state dropdown dynamically based on the chosen country).
         country_select = page.locator(
             '#countryCodeInput, '
             'select[name="countryCode"], '
@@ -439,9 +417,42 @@ async def run_order(browser, order_num: int) -> bool:
         try:
             await country_select.wait_for(state="visible", timeout=5_000)
             await country_select.select_option(value="US")
-            await human_delay(0.3, 0.7)
+            await human_delay(1, 2)  # wait for state dropdown to populate
         except (PwTimeout, Exception):
             dbg("Country select not found or already set")
+
+        # State/Province - handle as dropdown or text input
+        state_selector = (
+            '#provinceCodeInput, '
+            'select[name="stateOrProvince"], '
+            'select[name="stateOrProvinceCode"], '
+            'select[data-test="provinceCodeInput"], '
+            '#provinceInput'
+        )
+        state_el = page.locator(state_selector).first
+        try:
+            await state_el.wait_for(state="visible", timeout=8_000)
+            tag = await state_el.evaluate("el => el.tagName.toLowerCase()")
+            if tag == "select":
+                # Try matching by value first (abbreviation), then by label (full name)
+                try:
+                    await state_el.select_option(value=identity["state"])
+                except Exception:
+                    await state_el.select_option(label=identity["state"])
+                await human_delay(0.3, 0.7)
+            else:
+                # It's a text input
+                await state_el.click()
+                await state_el.fill("")
+                await slow_type(state_el, identity["state"], delay_lo=30, delay_hi=80)
+                await human_delay(0.3, 0.7)
+        except (PwTimeout, Exception) as exc:
+            dbg(f"State/Province field not found or failed: {exc}")
+
+        await fill_field(
+            '#postCodeInput, input[name="postalCode"], input[data-test="postCodeInput"]',
+            identity["zip"]
+        )
 
         await fill_field(
             '#phoneInput, input[name="phone"], input[data-test="phoneInput"]',
