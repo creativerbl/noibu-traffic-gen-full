@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Noibu Traffic Generator – Single-flow checkout runner.
+Noibu Traffic Generator – Randomised multi-product checkout runner.
 
-Navigates to noibudemo.com, adds "Orbit Terrarium - Large" to cart,
-completes checkout with random identity/address, then resets.
-Rate-limited to 1 order per minute with randomised device, browser & referrer.
+Navigates to noibudemo.com, picks 1-3 random products from the homepage,
+adds them to cart, completes checkout with random identity/address, then resets.
+Rate-limited to 1 order per 5 minutes with randomised device, browser & referrer.
 """
 
 import asyncio
@@ -23,8 +23,7 @@ from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 load_dotenv()
 
 ORIGIN = os.getenv("ORIGIN", "https://noibudemo.com")
-PRODUCT_PATH = os.getenv("PRODUCT_PATH", "/orbit-terrarium-large/")
-MIN_INTERVAL_S = int(os.getenv("MIN_INTERVAL_SECONDS", "60"))
+MIN_INTERVAL_S = int(os.getenv("MIN_INTERVAL_SECONDS", "300"))
 HEADLESS = os.getenv("HEADLESS", "0") == "1"
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
@@ -287,40 +286,129 @@ async def run_order(browser, order_num: int) -> bool:
         await page.goto(landing_url, wait_until="load")
         await human_delay(2, 4)
 
-        # ── Step 2: Scroll down and click on Orbit Terrarium ──
-        log(f"[Order #{order_num}] Step 2: Scrolling and clicking product")
-        await scroll_down(page, steps=random.randint(3, 6))
-        await human_delay(1, 2)
+        # ── Step 2: Browse homepage and add random products to cart ──
+        num_products = random.randint(1, 3)
+        log(f"[Order #{order_num}] Step 2: Will add {num_products} random product(s)")
 
-        # Try to find the product link
-        product_link = page.locator(f'a[href*="orbit-terrarium-large"]').first
-        try:
-            await product_link.scroll_into_view_if_needed(timeout=10_000)
-            await human_delay(0.5, 1.5)
-            await product_link.click()
-        except PwTimeout:
-            # Fallback: navigate directly to product page
-            dbg("Product link not found on homepage, navigating directly")
-            await page.goto(f"{ORIGIN}{PRODUCT_PATH}", wait_until="load")
+        products_added = []
+        for prod_idx in range(num_products):
+            # Scroll down the homepage to reveal product sections
+            await scroll_down(page, steps=random.randint(3, 7))
+            await human_delay(1, 2)
 
-        await page.wait_for_load_state("load")
-        await human_delay(2, 4)
-        log(f"[Order #{order_num}] Step 2: On product page")
+            # Collect all product card links on the homepage
+            # BigCommerce product cards are <a> inside .card or article elements
+            product_cards = page.locator(
+                '.card a.card-figure__link, '
+                '.card a.card-title a, '
+                '.card .card-body a, '
+                'article.card a[href*="/"], '
+                '.productGrid .card a[href*="/"], '
+                '.card-figure a[href], '
+                '.card a[href*="/"]'
+            )
+            card_count = await product_cards.count()
+            dbg(f"  Found {card_count} product card links on homepage")
 
-        # ── Step 3: Add to Cart ──
-        log(f"[Order #{order_num}] Step 3: Adding to cart")
-        await scroll_down(page, steps=random.randint(1, 3), step_px=200)
-        await human_delay(0.8, 1.5)
+            if card_count == 0:
+                log(f"[Order #{order_num}] WARNING: No product cards found on homepage")
+                break
 
-        add_btn = page.locator('#form-action-addToCart, [data-button-type="add-cart"], input[value="Add to Cart"], button:has-text("Add to Cart")').first
-        await add_btn.scroll_into_view_if_needed()
-        await human_delay(0.5, 1)
-        await add_btn.click()
-        await human_delay(2, 4)
-        log(f"[Order #{order_num}] Step 3: Added to cart")
+            # Pick a random card, avoiding ones we already added
+            attempts = 0
+            picked = False
+            while attempts < 10:
+                idx = random.randint(0, card_count - 1)
+                card = product_cards.nth(idx)
+                try:
+                    href = await card.get_attribute("href") or ""
+                    card_text = (await card.inner_text()).strip()[:60]
+                except Exception:
+                    href, card_text = "", ""
+                    attempts += 1
+                    continue
 
-        # ── Step 4: Proceed to checkout (popup or navigate) ──
-        log(f"[Order #{order_num}] Step 4: Proceeding to checkout")
+                # Skip if we already added this product
+                if href and href not in products_added:
+                    picked = True
+                    break
+                attempts += 1
+
+            if not picked:
+                dbg("  Could not find a new product to add, using whatever is available")
+                idx = random.randint(0, card_count - 1)
+                card = product_cards.nth(idx)
+                href = await card.get_attribute("href") or ""
+                card_text = ""
+
+            # Scroll to and click the chosen product
+            log(f"[Order #{order_num}]   Product {prod_idx + 1}/{num_products}: {card_text or href}")
+            try:
+                await card.scroll_into_view_if_needed(timeout=5_000)
+                await human_delay(0.5, 1.5)
+                await card.click()
+            except Exception:
+                # Fallback: navigate directly to the product URL
+                if href:
+                    full_url = href if href.startswith("http") else f"{ORIGIN}{href}"
+                    dbg(f"  Click failed, navigating directly to {full_url}")
+                    await page.goto(full_url, wait_until="load")
+                else:
+                    log(f"[Order #{order_num}]   WARNING: Could not navigate to product")
+                    continue
+
+            await page.wait_for_load_state("load")
+            await human_delay(2, 4)
+
+            # Browse the PDP a bit
+            await scroll_down(page, steps=random.randint(1, 3), step_px=200)
+            await human_delay(0.8, 1.5)
+
+            # Add to cart
+            add_btn = page.locator(
+                '#form-action-addToCart, '
+                '[data-button-type="add-cart"], '
+                'input[value="Add to Cart"], '
+                'button:has-text("Add to Cart")'
+            ).first
+            try:
+                await add_btn.scroll_into_view_if_needed()
+                await human_delay(0.5, 1)
+                await add_btn.click()
+                await human_delay(2, 4)
+                products_added.append(href)
+                log(f"[Order #{order_num}]   Added to cart ({len(products_added)}/{num_products})")
+            except Exception as e:
+                log(f"[Order #{order_num}]   WARNING: Could not add to cart: {e}")
+
+            # If more products to add, dismiss any cart popup and go back to homepage
+            if prod_idx < num_products - 1:
+                # Try to close cart preview popup if visible
+                try:
+                    close_btn = page.locator(
+                        '.previewCart .modal-close, '
+                        '[data-close], '
+                        'button[aria-label="Close"]'
+                    ).first
+                    if await close_btn.is_visible(timeout=2_000):
+                        await close_btn.click()
+                        await human_delay(0.5, 1)
+                except Exception:
+                    pass
+
+                # Navigate back to homepage for the next product
+                log(f"[Order #{order_num}]   Returning to homepage for next product...")
+                await page.goto(ORIGIN, wait_until="load")
+                await human_delay(2, 3)
+
+        if not products_added:
+            log(f"[Order #{order_num}] ✗ No products added to cart, skipping checkout")
+            return False
+
+        log(f"[Order #{order_num}] Step 2: Done - added {len(products_added)} product(s)")
+
+        # ── Step 3: Proceed to checkout (popup or navigate) ──
+        log(f"[Order #{order_num}] Step 3: Proceeding to checkout")
 
         # Try the modal/popup "Proceed to Checkout" or "Check out" button
         checkout_btn = page.locator(
@@ -344,10 +432,10 @@ async def run_order(browser, order_num: int) -> bool:
         # Wait for checkout page to load (React-based, may take a moment)
         await page.wait_for_load_state("networkidle", timeout=30_000)
         await human_delay(2, 4)
-        log(f"[Order #{order_num}] Step 4: On checkout page")
+        log(f"[Order #{order_num}] Step 3: On checkout page")
 
-        # ── Step 5: Enter email ──
-        log(f"[Order #{order_num}] Step 5: Entering email")
+        # ── Step 4: Enter email ──
+        log(f"[Order #{order_num}] Step 4: Entering email")
         email_input = page.locator('#email, input[data-test="customer-email"], input[name="email"], input[type="email"]').first
         await email_input.wait_for(state="visible", timeout=15_000)
         await human_delay(0.5, 1)
@@ -363,10 +451,10 @@ async def run_order(browser, order_num: int) -> bool:
         ).first
         await continue_btn.click()
         await human_delay(2, 4)
-        log(f"[Order #{order_num}] Step 5: Email entered - {identity['email']}")
+        log(f"[Order #{order_num}] Step 4: Email entered - {identity['email']}")
 
-        # ── Step 6: Fill shipping address ──
-        log(f"[Order #{order_num}] Step 6: Filling shipping address")
+        # ── Step 5: Fill shipping address ──
+        log(f"[Order #{order_num}] Step 5: Filling shipping address")
 
         # Wait for shipping form to appear
         first_name_field = page.locator(
@@ -483,7 +571,7 @@ async def run_order(browser, order_num: int) -> bool:
                     break
 
         await human_delay(3, 5)
-        log(f"[Order #{order_num}] Step 6: Shipping filled - {identity['street']}, {identity['city']}, {identity['state']}")
+        log(f"[Order #{order_num}] Step 5: Shipping filled - {identity['street']}, {identity['city']}, {identity['state']}")
 
         # If there's a shipping method step, click continue again
         try:
@@ -499,8 +587,8 @@ async def run_order(browser, order_num: int) -> bool:
         except Exception:
             pass
 
-        # ── Step 7: Select test payment provider ──
-        log(f"[Order #{order_num}] Step 7: Selecting payment method")
+        # ── Step 6: Select test payment provider ──
+        log(f"[Order #{order_num}] Step 6: Selecting payment method")
 
         # Debug: capture the payment section state
         await dump_page_debug(page, f"order{order_num}_payment_step")
@@ -538,8 +626,8 @@ async def run_order(browser, order_num: int) -> bool:
         if not payment_selected:
             dbg("No payment method radio found, may be auto-selected or single option")
 
-        # ── Step 8: Enter card details ──
-        log(f"[Order #{order_num}] Step 8: Entering card details")
+        # ── Step 7: Enter card details ──
+        log(f"[Order #{order_num}] Step 7: Entering card details")
         await human_delay(1, 2)
 
         # Debug: capture state after payment selection
@@ -683,10 +771,10 @@ async def run_order(browser, order_num: int) -> bool:
             await dump_page_debug(page, f"order{order_num}_card_FAILED")
 
         await human_delay(1, 2)
-        log(f"[Order #{order_num}] Step 8: Card details {'entered' if card_filled else 'FAILED'}")
+        log(f"[Order #{order_num}] Step 7: Card details {'entered' if card_filled else 'FAILED'}")
 
-        # ── Step 9: Place order ──
-        log(f"[Order #{order_num}] Step 9: Placing order")
+        # ── Step 8: Place order ──
+        log(f"[Order #{order_num}] Step 8: Placing order")
 
         PLACE_ORDER_SELECTORS = [
             '#checkout-payment-continue',
@@ -747,10 +835,10 @@ async def run_order(browser, order_num: int) -> bool:
 
 async def main():
     log("=" * 60)
-    log("Noibu Traffic Generator - Single Flow Checkout")
+    log("Noibu Traffic Generator - Random Multi-Product Checkout")
     log(f"Target: {ORIGIN}")
-    log(f"Product: {PRODUCT_PATH}")
-    log(f"Rate: max 1 order / {MIN_INTERVAL_S}s")
+    log(f"Rate: 1 order / {MIN_INTERVAL_S}s ({MIN_INTERVAL_S // 60} min)")
+    log(f"Products per order: 1-3 (randomised)")
     log(f"Headless: {HEADLESS} | Debug: {DEBUG}")
     log("=" * 60)
 
