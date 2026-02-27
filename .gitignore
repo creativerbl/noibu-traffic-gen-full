@@ -1,21 +1,6 @@
-# Virtual environment
 .venv/
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-
-# OS
-.DS_Store
-
-# IDE
-.vscode/
-.idea/
-
-# Debug output
-debug_*.png
-debug_*.json
-
-# Misc
 *.patch
+trafficgen/.DS_Store
+trafficgen/flows/.DS_Store
+.DS_Store
+/trafficgen/__pycache__/*

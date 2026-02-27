@@ -1,44 +1,33 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Detect Python 3
-PYTHON=""
-for cmd in python3 python; do
-    if command -v "$cmd" &>/dev/null; then
-        version=$("$cmd" --version 2>&1 | grep -oP '\d+\.\d+')
-        major=$(echo "$version" | cut -d. -f1)
-        if [ "$major" = "3" ]; then
-            PYTHON="$cmd"
-            break
-        fi
-    fi
-done
+# -----------------------------------------------------------------------------
+# noibu-traffic-gen runner
+# Creates/uses venv .venv, installs dependencies and Playwright browsers,
+# then runs the new Chromium-only traffic generator with .env support.
+# -----------------------------------------------------------------------------
 
-if [ -z "$PYTHON" ]; then
-    echo "ERROR: Python 3 not found. Please install Python 3.9+"
-    exit 1
+PYBIN="${PYTHON:-python3}"
+if ! command -v "$PYBIN" >/dev/null 2>&1; then
+  if command -v python3 >/dev/null 2>&1; then PYBIN="python3"
+  elif command -v python >/dev/null 2>&1; then PYBIN="python"
+  else echo "No python found on PATH"; exit 1; fi
 fi
 
-echo "Using: $PYTHON ($($PYTHON --version 2>&1))"
-
-# Create venv if needed
-if [ ! -d ".venv" ]; then
-    echo "Creating virtual environment..."
-    $PYTHON -m venv .venv
-fi
-
+echo ">> Using Python: $PYBIN"
+echo ">> Creating/using venv .venv"
+"$PYBIN" -m venv .venv
+# shellcheck disable=SC1090
 source .venv/bin/activate
 
-# Install dependencies
-echo "Installing dependencies..."
-pip install --quiet --upgrade pip
-pip install --quiet playwright python-dotenv
+echo ">> Upgrading pip and installing deps…"
+python -m pip install --upgrade pip
+python -m pip install playwright==1.48.0 typer==0.12.5 pydantic==2.8.2 PyYAML==6.0.2 \
+    python-dotenv==1.0.1 tenacity==8.5.0
 
-# Install Chromium browser
-echo "Installing Chromium browser..."
+echo ">> Installing Playwright Chromium browser…"
 python -m playwright install chromium
 
-# Run the traffic generator
-echo ""
-echo "Starting traffic generator..."
-python noibu-traffic-gen.py
+echo ">> Running noibu-traffic-gen.py …"
+export PYTHONUNBUFFERED=1
+python -u noibu-traffic-gen.py

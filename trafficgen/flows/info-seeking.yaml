@@ -1,0 +1,15 @@
+type: scripted
+name: "info-seeking"
+weight: 15
+steps:
+  - action: home_explore
+  - action: content_browse
+    pages:
+      - "/about-us/"
+      - "/shipping-returns/"
+      - "/contact-us/"
+      - "/help/"
+      - "/blog/"
+  - action: footer_explore
+  - action: content_page
+    slug: "/contact-us/"

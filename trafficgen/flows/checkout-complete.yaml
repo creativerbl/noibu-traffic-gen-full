@@ -1,0 +1,11 @@
+type: scripted
+name: "checkout-complete"
+weight: 15
+steps:
+  - action: home_explore
+  - action: category_explore
+  - action: add_to_cart
+  - action: view_cart
+  - action: cart_edit
+  - action: start_checkout
+  - action: maybe_complete_checkout
