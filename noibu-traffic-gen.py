@@ -608,55 +608,75 @@ async def run_order(browser, order_num: int) -> bool:
             dbg("Filled card details via direct page inputs")
 
         # Attempt 2: Look inside iframes
+        # BigCommerce hosted payment uses SEPARATE iframes per field,
+        # so we must search across ALL iframes for each field individually.
         if not card_filled:
-            dbg(f"Checking {len(page.frames)} frames for card inputs...")
-            for i, frame in enumerate(page.frames):
-                if frame == page.main_frame:
-                    continue
-                dbg(f"  Checking frame[{i}]: name={frame.name!r} url={frame.url}")
-                try:
-                    for sel in ['input[name="cardnumber"]', 'input[id*="card-number"]',
-                                'input[name="credit-card-number"]', 'input[autocomplete="cc-number"]',
-                                'input[placeholder*="Card"]']:
-                        cc_in_frame = frame.locator(sel).first
+            full_name = f"{identity['first_name']} {identity['last_name']}"
+            non_main_frames = [f for f in page.frames if f != page.main_frame]
+            dbg(f"Checking {len(non_main_frames)} child frames for card inputs...")
+
+            # Define what to look for in each field category
+            iframe_field_map = [
+                ("card number", CARD_NUMBER, [
+                    'input[name="cardnumber"]', 'input[id*="card-number"]',
+                    'input[name="credit-card-number"]', 'input[autocomplete="cc-number"]',
+                    'input[placeholder*="Card Number"]', 'input[placeholder*="card number"]',
+                    'input[id*="ccNumber"]', 'input[data-test="credit-card-number-input"]',
+                    'input',  # last resort: only input in the frame
+                ]),
+                ("expiry", CARD_EXPIRY, [
+                    'input[name="exp-date"]', 'input[name="expiry"]',
+                    'input[autocomplete="cc-exp"]', 'input[placeholder*="MM"]',
+                    'input[placeholder*="Expir"]', 'input[id*="ccExpiry"]',
+                    'input[data-test="credit-card-expiry-input"]',
+                    'input',
+                ]),
+                ("name on card", full_name, [
+                    'input[name="ccName"]', 'input[autocomplete="cc-name"]',
+                    'input[placeholder*="Name"]', 'input[id*="ccName"]',
+                    'input[data-test="credit-card-name-input"]',
+                    'input',
+                ]),
+                ("cvv", CARD_CVV, [
+                    'input[name="cvc"]', 'input[name="cvv"]',
+                    'input[autocomplete="cc-csc"]', 'input[placeholder*="CVV"]',
+                    'input[placeholder*="CVC"]', 'input[id*="ccCvv"]',
+                    'input[data-test="credit-card-cvv-input"]',
+                    'input',
+                ]),
+            ]
+
+            fields_filled = 0
+            used_frames = set()  # track which frames we already filled
+
+            for label, value, selectors in iframe_field_map:
+                filled_this = False
+                for frame in non_main_frames:
+                    if id(frame) in used_frames:
+                        continue
+                    for sel in selectors:
                         try:
-                            if await cc_in_frame.is_visible(timeout=2_000):
-                                await cc_in_frame.click()
-                                await slow_type(cc_in_frame, CARD_NUMBER)
-
-                                # Find expiry in same frame
-                                for exp_sel in ['input[name="exp-date"]', 'input[name="expiry"]',
-                                                'input[autocomplete="cc-exp"]', 'input[placeholder*="MM"]']:
-                                    exp_f = frame.locator(exp_sel).first
-                                    try:
-                                        if await exp_f.is_visible(timeout=1_000):
-                                            await exp_f.click()
-                                            await slow_type(exp_f, CARD_EXPIRY)
-                                            break
-                                    except Exception:
-                                        continue
-
-                                # Find CVV in same frame
-                                for cvv_sel in ['input[name="cvc"]', 'input[name="cvv"]',
-                                                'input[autocomplete="cc-csc"]', 'input[placeholder*="CVV"]']:
-                                    cvv_f = frame.locator(cvv_sel).first
-                                    try:
-                                        if await cvv_f.is_visible(timeout=1_000):
-                                            await cvv_f.click()
-                                            await slow_type(cvv_f, CARD_CVV)
-                                            break
-                                    except Exception:
-                                        continue
-
-                                card_filled = True
-                                dbg(f"Filled card details via iframe[{i}]")
+                            loc = frame.locator(sel).first
+                            if await loc.is_visible(timeout=2_000):
+                                await loc.click()
+                                await loc.fill("")
+                                await slow_type(loc, value)
+                                await human_delay(0.3, 0.6)
+                                used_frames.add(id(frame))
+                                fields_filled += 1
+                                filled_this = True
+                                dbg(f"  Filled {label} in frame url={frame.url[:80]}")
                                 break
                         except Exception:
                             continue
-                    if card_filled:
+                    if filled_this:
                         break
-                except Exception as e:
-                    dbg(f"  Frame[{i}] error: {e}")
+                if not filled_this:
+                    dbg(f"  Could not find {label} in any iframe")
+
+            if fields_filled >= 3:  # card number + expiry + cvv at minimum
+                card_filled = True
+                dbg(f"Filled {fields_filled}/4 card fields across iframes")
 
         if not card_filled:
             log(f"[Order #{order_num}] WARNING: Could not find card input fields")
