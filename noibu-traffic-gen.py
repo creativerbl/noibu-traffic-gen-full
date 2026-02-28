@@ -286,6 +286,36 @@ async def run_order(browser, order_num: int) -> bool:
         await page.goto(landing_url, wait_until="load")
         await human_delay(2, 4)
 
+        # ── Generate Noibu helpcode ──
+        helpcode = None
+
+        def _on_dialog(dialog):
+            nonlocal helpcode
+            # The prompt dialog contains the helpcode as its default value
+            helpcode = dialog.default_value or dialog.message
+            asyncio.ensure_future(dialog.accept())
+
+        page.on("dialog", _on_dialog)
+
+        try:
+            helpcode_btn = page.locator(
+                'button:has-text("Generate Helpcode"), '
+                'a:has-text("Generate Helpcode"), '
+                '[class*="helpcode"], '
+                'button:has-text("Generate Help")'
+            ).first
+            if await helpcode_btn.is_visible(timeout=5_000):
+                await helpcode_btn.click()
+                await human_delay(1, 2)
+                if helpcode:
+                    log(f"[Order #{order_num}] Noibu Helpcode: {helpcode}")
+                else:
+                    dbg("Helpcode button clicked but no dialog appeared")
+        except Exception:
+            dbg("Helpcode button not found, skipping")
+
+        page.remove_listener("dialog", _on_dialog)
+
         # ── Step 2: Browse homepage and add random products to cart ──
         num_products = random.randint(1, 3)
         log(f"[Order #{order_num}] Step 2: Will add {num_products} random product(s)")
