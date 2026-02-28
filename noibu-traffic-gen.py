@@ -289,30 +289,29 @@ async def run_order(browser, order_num: int) -> bool:
         # ── Generate Noibu helpcode ──
         helpcode = None
 
+        # Auto-accept any prompt/alert dialogs that Noibu might trigger
         def _on_dialog(dialog):
             nonlocal helpcode
-            # The prompt dialog contains the helpcode as its default value
             helpcode = dialog.default_value or dialog.message
             asyncio.ensure_future(dialog.accept())
 
         page.on("dialog", _on_dialog)
 
         try:
-            helpcode_btn = page.locator(
-                'button:has-text("Generate Helpcode"), '
-                'a:has-text("Generate Helpcode"), '
-                '[class*="helpcode"], '
-                'button:has-text("Generate Help")'
-            ).first
-            if await helpcode_btn.is_visible(timeout=5_000):
-                await helpcode_btn.click()
-                await human_delay(1, 2)
-                if helpcode:
-                    log(f"[Order #{order_num}] Noibu Helpcode: {helpcode}")
-                else:
-                    dbg("Helpcode button clicked but no dialog appeared")
-        except Exception:
-            dbg("Helpcode button not found, skipping")
+            # Call Noibu JS API directly to generate the helpcode
+            helpcode = await page.evaluate("""() => {
+                if (window.NOIBUJS && typeof window.NOIBUJS.requestHelpCode === 'function') {
+                    return window.NOIBUJS.requestHelpCode(true);
+                }
+                return null;
+            }""")
+            await human_delay(1, 2)
+            if helpcode:
+                log(f"[Order #{order_num}] Noibu Helpcode: {helpcode}")
+            else:
+                dbg("NOIBUJS.requestHelpCode returned null/empty")
+        except Exception as e:
+            dbg(f"Helpcode generation failed: {e}")
 
         page.remove_listener("dialog", _on_dialog)
 
