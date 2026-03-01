@@ -14,7 +14,6 @@ import signal
 import string
 import sys
 import time
-import json
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PwTimeout
@@ -201,42 +200,6 @@ async def scroll_down(page, steps: int = 3, step_px: int = 300):
         await page.mouse.wheel(0, step_px + random.randint(-50, 100))
         await asyncio.sleep(random.uniform(0.3, 0.8))
 
-
-async def dump_page_debug(page, label: str):
-    """Save screenshot + HTML dump for debugging."""
-    try:
-        safe = label.replace(" ", "_").replace("#", "")
-        await page.screenshot(path=f"debug_{safe}.png", full_page=True)
-        log(f"  Screenshot saved: debug_{safe}.png")
-
-        # Dump all visible input/select/button/label/iframe elements
-        elements = await page.evaluate("""() => {
-            const results = [];
-            const sels = 'input,select,button,label,iframe,a[href*="checkout"],a[href*="cart"],.form-checklist-item,[data-test],[class*="payment"],[class*="credit"],[id*="cc"],[id*="card"]';
-            document.querySelectorAll(sels).forEach(el => {
-                const rect = el.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) {
-                    results.push({
-                        tag: el.tagName.toLowerCase(),
-                        id: el.id || '',
-                        name: el.getAttribute('name') || '',
-                        type: el.getAttribute('type') || '',
-                        class: el.className ? el.className.toString().slice(0, 100) : '',
-                        dataTest: el.getAttribute('data-test') || '',
-                        text: el.textContent ? el.textContent.trim().slice(0, 80) : '',
-                        value: el.value ? el.value.slice(0, 40) : '',
-                        href: el.getAttribute('href') || '',
-                        src: el.getAttribute('src') || '',
-                    });
-                }
-            });
-            return results;
-        }""")
-        with open(f"debug_{safe}_elements.json", "w") as f:
-            json.dump(elements, f, indent=2)
-        log(f"  Element dump saved: debug_{safe}_elements.json ({len(elements)} elements)")
-    except Exception as e:
-        log(f"  Debug dump failed: {e}")
 
 
 # ── main flow ────────────────────────────────────────────────────────────────
@@ -619,9 +582,6 @@ async def run_order(browser, order_num: int) -> bool:
         # ── Step 6: Select test payment provider ──
         log(f"[Order #{order_num}] Step 6: Selecting payment method")
 
-        # Debug: capture the payment section state
-        await dump_page_debug(page, f"order{order_num}_payment_step")
-
         # Also dump iframe info
         frames = page.frames
         for i, frame in enumerate(frames):
@@ -658,9 +618,6 @@ async def run_order(browser, order_num: int) -> bool:
         # ── Step 7: Enter card details ──
         log(f"[Order #{order_num}] Step 7: Entering card details")
         await human_delay(1, 2)
-
-        # Debug: capture state after payment selection
-        await dump_page_debug(page, f"order{order_num}_card_entry_step")
 
         card_filled = False
 
@@ -797,7 +754,6 @@ async def run_order(browser, order_num: int) -> bool:
 
         if not card_filled:
             log(f"[Order #{order_num}] WARNING: Could not find card input fields")
-            await dump_page_debug(page, f"order{order_num}_card_FAILED")
 
         await human_delay(1, 2)
         log(f"[Order #{order_num}] Step 7: Card details {'entered' if card_filled else 'FAILED'}")
@@ -830,7 +786,6 @@ async def run_order(browser, order_num: int) -> bool:
 
         if not order_clicked:
             log(f"[Order #{order_num}] WARNING: Could not find Place Order button")
-            await dump_page_debug(page, f"order{order_num}_placeorder_FAILED")
 
         # Wait for order confirmation
         await human_delay(5, 8)
