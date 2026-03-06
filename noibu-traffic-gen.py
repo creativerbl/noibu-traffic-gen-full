@@ -84,18 +84,7 @@ DEVICE_PROFILES = [
     },
 ]
 
-# ── referrer sources ─────────────────────────────────────────────────────────
-
-REFERRERS = [
-    {"source": "google", "url": "https://www.google.com/", "utm_medium": "organic"},
-    {"source": "facebook", "url": "https://www.facebook.com/", "utm_medium": "paid-social"},
-    {"source": "instagram", "url": "https://www.instagram.com/", "utm_medium": "social"},
-    {"source": "tiktok", "url": "https://www.tiktok.com/", "utm_medium": "social"},
-    {"source": "direct", "url": "", "utm_medium": "none"},
-    {"source": "bing", "url": "https://www.bing.com/", "utm_medium": "organic"},
-    {"source": "linkedin", "url": "https://www.linkedin.com/", "utm_medium": "social"},
-    {"source": "reddit", "url": "https://www.reddit.com/", "utm_medium": "social"},
-]
+# (referrer sources removed – all sessions land as direct traffic)
 
 # ── locales / timezones ──────────────────────────────────────────────────────
 
@@ -207,15 +196,13 @@ async def scroll_down(page, steps: int = 3, step_px: int = 300):
 async def run_order(browser, order_num: int) -> bool:
     """Execute one full order flow. Returns True on success."""
 
-    # Pick random device, referrer, locale, timezone
+    # Pick random device, locale, timezone
     device = random.choice(DEVICE_PROFILES)
-    referrer = random.choice(REFERRERS)
     locale = random.choice(LOCALES)
     tz = random.choice(TIMEZONES)
     identity = _rand_identity()
 
-    log(f"[Order #{order_num}] Device: {device['name']} | "
-        f"Referrer: {referrer['source']} | Locale: {locale}")
+    log(f"[Order #{order_num}] Device: {device['name']} | Locale: {locale}")
 
     # Build context options
     ctx_opts = {
@@ -231,14 +218,11 @@ async def run_order(browser, order_num: int) -> bool:
     # Prevent service workers from caching across sessions
     ctx_opts["service_workers"] = "block"
 
-    # Set HTTP headers: referer (if not direct) + cache-busting
-    extra_headers = {
+    # Set HTTP headers: cache-busting only (no referrer)
+    ctx_opts["extra_http_headers"] = {
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Pragma": "no-cache",
     }
-    if referrer["url"]:
-        extra_headers["Referer"] = referrer["url"]
-    ctx_opts["extra_http_headers"] = extra_headers
 
     context = await browser.new_context(**ctx_opts)
 
@@ -255,16 +239,9 @@ async def run_order(browser, order_num: int) -> bool:
     page.set_default_timeout(30_000)
 
     try:
-        # ── Step 1: Land on homepage ──
-        landing_url = ORIGIN
-        if referrer["source"] != "direct":
-            landing_url += (
-                f"?utm_source={referrer['source']}"
-                f"&utm_medium={referrer['utm_medium']}"
-                f"&utm_campaign=trafficgen"
-            )
+        # ── Step 1: Land on homepage (direct, no referrer/UTM) ──
         log(f"[Order #{order_num}] Step 1: Landing on {ORIGIN}")
-        await page.goto(landing_url, wait_until="load")
+        await page.goto(ORIGIN, wait_until="load")
         await human_delay(2, 4)
 
         # ── Generate Noibu helpcode ──
