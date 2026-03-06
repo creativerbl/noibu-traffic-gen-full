@@ -794,12 +794,14 @@ async def run_order(browser, order_num: int) -> bool:
         try:
             await page.wait_for_url("**/order-confirmation**", timeout=30_000)
             log(f"[Order #{order_num}] ✓ ORDER PLACED SUCCESSFULLY")
+            await human_delay(5, 10)
             return True
         except PwTimeout:
             # Check page content for success indicators
             content = await page.content()
             if any(w in content.lower() for w in ["thank you", "order confirmation", "order number", "order-confirmation"]):
                 log(f"[Order #{order_num}] ✓ ORDER PLACED SUCCESSFULLY")
+                await human_delay(5, 10)
                 return True
             else:
                 log(f"[Order #{order_num}] ✗ Order placement uncertain - no confirmation detected")
