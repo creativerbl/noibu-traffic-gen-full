@@ -228,11 +228,29 @@ async def run_order(browser, order_num: int) -> bool:
         "timezone_id": tz,
     }
 
-    # Set HTTP referer header if not direct
+    # Prevent service workers from caching across sessions
+    ctx_opts["service_workers"] = "block"
+
+    # Set HTTP headers: referer (if not direct) + cache-busting
+    extra_headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+    }
     if referrer["url"]:
-        ctx_opts["extra_http_headers"] = {"Referer": referrer["url"]}
+        extra_headers["Referer"] = referrer["url"]
+    ctx_opts["extra_http_headers"] = extra_headers
 
     context = await browser.new_context(**ctx_opts)
+
+    # Intercept all requests to force cache bypass at the network level
+    async def _bypass_cache(route):
+        headers = {**route.request.headers}
+        headers["Cache-Control"] = "no-cache, no-store"
+        headers["Pragma"] = "no-cache"
+        await route.continue_(headers=headers)
+
+    await context.route("**/*", _bypass_cache)
+
     page = await context.new_page()
     page.set_default_timeout(30_000)
 
@@ -843,7 +861,15 @@ async def main():
     async with async_playwright() as pw:
         while not shutdown.is_set():
             # Launch fresh browser for each order (resilience + fingerprint rotation)
-            launch_opts = {"headless": HEADLESS}
+            launch_opts = {
+                "headless": HEADLESS,
+                "args": [
+                    "--disable-cache",
+                    "--disable-application-cache",
+                    "--disk-cache-size=0",
+                    "--aggressive-cache-discard",
+                ],
+            }
             if not HEADLESS:
                 launch_opts["slow_mo"] = 100  # 100ms delay between actions for visibility
             browser = await pw.chromium.launch(**launch_opts)
