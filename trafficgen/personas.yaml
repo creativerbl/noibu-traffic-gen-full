@@ -1,0 +1,105 @@
+# trafficgen/personas.yaml
+#
+# Persona definitions for the unified traffic generator.
+#
+# Schema (per persona):
+#   name:    unique identifier (string, required)
+#   weight:  relative likelihood of a session being this persona (number)
+#   utm:     null for direct traffic, or a map of:
+#              source:      fixed utm_source value
+#              source_pool: list of utm_source values; one is picked at
+#                           random per session (mutually exclusive w/ source)
+#              medium:      utm_medium value (or null to omit)
+#              campaign:    utm_campaign value (or null to omit)
+#            UTM params are appended to the landing URL as query params —
+#            cache-key safe, so always applied.
+#   referer: true to also send a full Referer header derived from
+#            utm source (e.g. https://www.google.com/); false for none.
+#            Safe because every session gets the 3-layer no-cache treatment
+#            (see trafficgen/attribution.py).
+#   flow_overrides: optional map of flow name -> weight MULTIPLIER applied
+#            to that flow's base weight when picking this persona's flow.
+#   funnel:  per-session probabilities:
+#     bounce:            land, glance, leave (3-10s dwell, no browsing)
+#     add_to_cart:       (if not bounced) session adds a product to cart
+#     checkout_start:    (if added to cart) session proceeds to checkout
+#     checkout_complete: (if checkout started) session places the order;
+#                        also gated by the global order rate limiter
+#                        (ORDER_MIN_INTERVAL_SECONDS) — denied sessions
+#                        abandon at the payment stage instead.
+
+personas:
+  - name: direct_loyalist
+    weight: 20
+    utm: null
+    referer: false
+    funnel:
+      bounce: 0.30
+      add_to_cart: 0.35
+      checkout_start: 0.55
+      checkout_complete: 0.50
+
+  - name: google_organic
+    weight: 25
+    utm:
+      source: google
+      medium: organic
+      campaign: null
+    referer: true
+    funnel:
+      bounce: 0.38
+      add_to_cart: 0.28
+      checkout_start: 0.50
+      checkout_complete: 0.45
+
+  - name: email_klaviyo
+    weight: 8
+    utm:
+      source: klaviyo
+      medium: email
+      campaign: weekly-promo
+    referer: false
+    funnel:
+      bounce: 0.25
+      add_to_cart: 0.40
+      checkout_start: 0.60
+      checkout_complete: 0.55
+
+  - name: paid_social
+    weight: 25
+    utm:
+      source_pool: [facebook, instagram, tiktok]
+      medium: paid-social
+      campaign: spring-sale
+    referer: true
+    funnel:
+      bounce: 0.55
+      add_to_cart: 0.12
+      checkout_start: 0.30
+      checkout_complete: 0.25
+
+  - name: comparison_shopper
+    weight: 10
+    utm:
+      source_pool: [bing, duckduckgo]
+      medium: organic
+      campaign: null
+    referer: true
+    funnel:
+      bounce: 0.40
+      add_to_cart: 0.30
+      checkout_start: 0.40
+      checkout_complete: 0.20
+
+  - name: window_shopper
+    weight: 12
+    utm:
+      source_pool: [reddit, linkedin]
+      medium: referral
+      campaign: null
+    referer: true
+    funnel:
+      bounce: 0.60
+      add_to_cart: 0.08
+      checkout_start: 0.15
+      checkout_complete: 0.10

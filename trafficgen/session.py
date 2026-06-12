@@ -16,6 +16,8 @@ from trafficgen.utils import (
     think,
     weighted_value,
 )
+from trafficgen import attribution
+from trafficgen import checkout as checkout_engine
 
 ALLOW_NAV_TIMEOUT = 25000
 SEL_TIMEOUT = 15000
@@ -127,7 +129,9 @@ class Session:
                  global_qps,
                  debug: bool = False,
                  fault_profile: Optional[dict] = None,
-                 referrer_url: Optional[str] = None):
+                 referrer_url: Optional[str] = None,
+                 persona: Optional[Dict[str, Any]] = None,
+                 may_place_order=None):
         self.id = session_id
         self.browser = browser
         self.playwright = playwright
@@ -143,6 +147,8 @@ class Session:
         self.global_qps = global_qps
         self.debug = debug
         self.fault_profile = fault_profile or {}
+        self.persona = persona if isinstance(persona, dict) else None
+        self.may_place_order = may_place_order
         self.flow_weight_overrides = _parse_weight_overrides(os.getenv("FLOW_WEIGHTS", ""))
 
         # UTM source (legacy env choice supplied by Runner)
@@ -212,12 +218,24 @@ class Session:
         self.funnel_checkout_rate = float(os.getenv("FUNNEL_CHECKOUT_START_RATE","0.50"))
         self.funnel_max_cart_adds = int(os.getenv("FUNNEL_MAX_CART_ADDS_PER_SESSION","1"))
         self.funnel_max_checkout_starts = int(os.getenv("FUNNEL_MAX_CHECKOUT_STARTS_PER_SESSION","1"))
-        self.flag_is_atc_session = (random.random() < self.funnel_atc_rate)
-        self.flag_should_checkout = (self.flag_is_atc_session and (random.random() < self.funnel_checkout_rate))
+        # Persona funnel probabilities take precedence over FUNNEL_* env rates.
+        persona_funnel = (self.persona or {}).get("funnel")
+        if isinstance(persona_funnel, dict):
+            self.flag_bounce = (random.random() < float(persona_funnel.get("bounce", 0.0) or 0.0))
+            atc_rate = float(persona_funnel.get("add_to_cart", self.funnel_atc_rate) or 0.0)
+            checkout_start_rate = float(persona_funnel.get("checkout_start", self.funnel_checkout_rate) or 0.0)
+        else:
+            self.flag_bounce = False
+            atc_rate = self.funnel_atc_rate
+            checkout_start_rate = self.funnel_checkout_rate
+        self.flag_is_atc_session = (not self.flag_bounce) and (random.random() < atc_rate)
+        self.flag_should_checkout = (self.flag_is_atc_session and (random.random() < checkout_start_rate))
         self.did_add_to_cart = 0
         self.did_start_checkout = 0
+        self.did_complete_checkout = 0
         self.stop_requested = False
         self._apply_flow_weight_overrides()
+        self._apply_persona_flow_overrides()
         self._flow_weights_available = any(isinstance(f, dict) and "weight" in f for f in self.flows)
 
         # Search
@@ -234,7 +252,11 @@ class Session:
         cargs["locale"] = self.locale
         cargs["timezone_id"] = self.tz
         cargs.setdefault("ignore_https_errors", True)
+        # 3-layer no-cache treatment (all sessions): CloudFront varies cache
+        # on Referer; cached cross-referrer responses broke Noibu loading.
+        cargs["service_workers"] = "block"
         self.context = await self.browser.new_context(**cargs)
+        await attribution.apply_no_cache(self.context)
         self.page = await self.context.new_page()
 
     def _apply_flow_weight_overrides(self):
@@ -248,6 +270,29 @@ class Session:
                 continue
             if name in self.flow_weight_overrides:
                 f["weight"] = self.flow_weight_overrides[name]
+
+    def _apply_persona_flow_overrides(self):
+        overrides = (self.persona or {}).get("flow_overrides")
+        if not isinstance(overrides, dict) or not overrides:
+            return
+        norm = {_normalize_label(str(k)): v for k, v in overrides.items()}
+        # Copy flow dicts so per-persona multipliers never mutate shared state.
+        self.flows = [dict(f) if isinstance(f, dict) else f for f in self.flows]
+        for f in self.flows:
+            if not isinstance(f, dict):
+                continue
+            name = _normalize_label(f.get("name") or "")
+            if name not in norm:
+                continue
+            try:
+                mult = max(float(norm[name]), 0.0)
+            except Exception:
+                continue
+            try:
+                base = float(f.get("weight", 1) or 1)
+            except Exception:
+                base = 1.0
+            f["weight"] = base * mult
 
     def _pick_flow(self) -> Optional[dict]:
         if not self.flows:
@@ -347,12 +392,15 @@ class Session:
                 raise last_exc
             raise RuntimeError("browser context creation failed")
         try:
+            if self.persona is not None and self.flag_bounce:
+                await self._bounce_session()
+                return
             flow = self._pick_flow()
             if not flow:
                 return
             await self._run_scripted(flow)
         finally:
-            debug_print(self.debug, f"[S{self.id}] summary: atc={self.did_add_to_cart} checkout={self.did_start_checkout}")
+            debug_print(self.debug, f"[S{self.id}] summary: atc={self.did_add_to_cart} checkout={self.did_start_checkout} completed={self.did_complete_checkout}")
             if self.context:
                 with contextlib.suppress(Exception):
                     await self.context.close()
@@ -376,7 +424,30 @@ class Session:
         if (not self.stop_requested) and random.random() < self.coverage_prob:
             await self._coverage_click_pass()
 
+    async def _bounce_session(self):
+        """Persona bounce: land, glance (light/no scroll), dwell 3-10s, leave."""
+        landing = attribution.landing_url(self.origin, self.persona)
+        referer_hdr = attribution.referer_header(self.persona)
+        debug_print(self.debug, f"[S{self.id}] persona '{(self.persona or {}).get('name')}' BOUNCE landing: {landing} | referer={referer_hdr or 'none'}")
+        await self._guarded_goto(landing, referer=referer_hdr)
+        await self._maybe_scroll_page(prob=0.35, depth_min=0.05, depth_max=0.25, steps_min=1, steps_max=2)
+        await asyncio.sleep(random.uniform(3.0, 10.0))
+
     async def _landing(self):
+        # Persona attribution takes precedence over legacy REFERRER_* env logic.
+        if self.persona is not None:
+            landing = attribution.landing_url(self.origin, self.persona)
+            referer_hdr = attribution.referer_header(self.persona)
+            debug_print(self.debug, f"[S{self.id}] persona '{self.persona.get('name')}' landing: {landing} | referer={referer_hdr or 'none'}")
+            await self._guarded_goto(landing, referer=referer_hdr)
+            try:
+                ref = await self.page.evaluate("document.referrer")
+                debug_print(self.debug, f"[S{self.id}] document.referrer='{ref}'")
+            except Exception:
+                pass
+            await self._maybe_scroll_page()
+            return
+
         landing = self.origin + "/"
         referer_hdr: Optional[str] = None
 
@@ -1460,8 +1531,60 @@ class Session:
                     continue
         await self._maybe_scroll_page(prob=0.4, depth_min=0.08, depth_max=0.2, steps_min=1, steps_max=2)
 
+    async def _persona_checkout(self):
+        """Persona-driven checkout: proceed, then complete or abandon.
+
+        Completion requires the persona's checkout_complete roll AND the
+        global order rate limiter (may_place_order). Denied/failed rolls
+        abandon at a weighted random stage instead.
+        """
+        if self.did_start_checkout >= self.funnel_max_checkout_starts:
+            return
+        if not self.flag_should_checkout or self.did_add_to_cart <= 0:
+            return
+        funnel = (self.persona or {}).get("funnel") or {}
+        if not await checkout_engine.proceed_to_checkout(self.page, debug=self.debug):
+            return
+        self.did_start_checkout += 1
+        complete = random.random() < float(funnel.get("checkout_complete", 0.0) or 0.0)
+        forced_stage: Optional[str] = None
+        if complete:
+            allowed = True
+            if self.may_place_order is not None:
+                allowed = await self.may_place_order()
+            if not allowed:
+                debug_print(self.debug, f"[S{self.id}] order rate limit active; abandoning at payment instead")
+                complete = False
+                forced_stage = "payment"
+        if complete:
+            identity = checkout_engine.random_identity()
+            card = {
+                "number": os.getenv("CARD_NUMBER", "4111111111111111"),
+                "expiry": os.getenv("CARD_EXPIRY", "01/30"),
+                "cvv": os.getenv("CARD_CVV", "989"),
+            }
+            if await checkout_engine.complete_checkout(self.page, identity, card, debug=self.debug):
+                self.did_complete_checkout += 1
+                debug_print(self.debug, f"[S{self.id}] checkout COMPLETED")
+            else:
+                debug_print(self.debug, f"[S{self.id}] checkout completion failed")
+        else:
+            stage = forced_stage
+            if stage is None:
+                picked = choose_weighted([
+                    {"stage": "customer", "weight": 0.2},
+                    {"stage": "shipping", "weight": 0.3},
+                    {"stage": "payment", "weight": 0.5},
+                ], key="weight") or {}
+                stage = picked.get("stage", "payment")
+            await checkout_engine.abandon_checkout(self.page, stage, debug=self.debug)
+        self.stop_requested = True
+
     async def _start_checkout(self):
         if self.did_start_checkout >= self.funnel_max_checkout_starts:
+            return
+        if self.persona is not None:
+            await self._persona_checkout()
             return
         try:
             btn = self.page.get_by_role("link", name=re.compile("checkout", re.I))

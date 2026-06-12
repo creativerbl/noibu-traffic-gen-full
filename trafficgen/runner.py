@@ -13,6 +13,7 @@ from playwright.async_api import async_playwright
 from trafficgen.devices import build_device_pool, pick_device
 from trafficgen.session import Session
 from trafficgen.utils import TokenBucket, debug_print
+from trafficgen import attribution
 
 @dataclass
 class RunnerConfig:
@@ -59,6 +60,28 @@ def _weighted_pick(items: List[Dict[str, Any]], key: str = "weight") -> Optional
             return it
     return items[-1]
 
+class OrderRateLimiter:
+    """Global rate limiter for completed orders.
+
+    An asyncio.Lock-protected timestamp: at most one completed order per
+    ORDER_MIN_INTERVAL_SECONDS across all concurrent sessions. Sessions call
+    may_place_order() right before completing checkout; if denied they
+    abandon at the payment stage instead.
+    """
+
+    def __init__(self, min_interval_s: float):
+        self.min_interval = max(float(min_interval_s or 0.0), 0.0)
+        self._lock = asyncio.Lock()
+        self._last_order_at = 0.0
+
+    async def may_place_order(self) -> bool:
+        async with self._lock:
+            now = time.monotonic()
+            if self._last_order_at and (now - self._last_order_at) < self.min_interval:
+                return False
+            self._last_order_at = now
+            return True
+
 class Runner:
     def __init__(self, cfg: RunnerConfig):
         self.cfg = cfg
@@ -67,6 +90,17 @@ class Runner:
         self.global_qps = TokenBucket(rate_per_sec=self.cfg.global_qps_cap)
         self.session_counter = 0
         self.smoke_limit = 3 if self.cfg.smoke else None
+
+        # Personas (loaded once) + global order rate limiter
+        personas_file = os.getenv("PERSONAS_FILE", "trafficgen/personas.yaml")
+        self.personas = attribution.load_personas(personas_file)
+        if self.personas:
+            debug_print(self.cfg.debug, f"Loaded {len(self.personas)} personas from {personas_file}")
+        else:
+            debug_print(self.cfg.debug, f"No personas loaded from {personas_file}; using legacy referrer/funnel env config")
+        self.order_limiter = OrderRateLimiter(
+            self._parse_float_env("ORDER_MIN_INTERVAL_SECONDS", default=300.0, minimum=0.0)
+        )
 
         # Health + telemetry
         self.restart_event = asyncio.Event()
@@ -139,11 +173,19 @@ class Runner:
         for s in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(s, lambda s=s: asyncio.create_task(self._graceful_stop(s)))
 
-        headless = True  # Chromium-only; headless by default
+        headless = os.getenv("HEADLESS", "1") != "0"  # Chromium-only; headless by default
         async with async_playwright() as pw:
             device_pool = build_device_pool(self.cfg.device_mix)
             while not self.stop_event.is_set():
-                browser = await pw.chromium.launch(headless=headless)
+                browser = await pw.chromium.launch(
+                    headless=headless,
+                    args=[
+                        "--disable-cache",
+                        "--disable-application-cache",
+                        "--disk-cache-size=0",
+                        "--aggressive-cache-discard",
+                    ],
+                )
                 self._on_browser_launch()
                 try:
                     await self._schedule_loop(browser, pw, device_pool)
@@ -307,7 +349,8 @@ class Runner:
             import random as _random
             locale = _random.choice(self.cfg.locales or ["en-US"])
             tz = _random.choice(self.cfg.timezones or ["America/Toronto"])
-            ref = self._choose_referrer_for_session()
+            persona = attribution.choose_persona(self.personas) if self.personas else None
+            ref = self._choose_referrer_for_session() if persona is None else None
             s = Session(
                 session_id=sid,
                 browser=browser,
@@ -325,6 +368,8 @@ class Runner:
                 debug=self.cfg.debug,
                 fault_profile={"slow_request_fraction": 0.03},
                 referrer_url=ref,
+                persona=persona,
+                may_place_order=self.order_limiter.may_place_order,
             )
             try:
                 await asyncio.wait_for(s.run(), timeout=self._session_timeout)
