@@ -1031,19 +1031,53 @@ class Session:
                 return
         await self._maybe_scroll_page()
 
+    async def _open_product_link(self) -> bool:
+        """Open a random product page robustly.
+
+        Try a human-like click on a VISIBLE product link first (themes such
+        as Dawn render a hidden 0x0 duplicate of every card link, which makes
+        index-based clicks hang on visibility checks). If the click fails for
+        any reason, fall back to harvesting hrefs and navigating directly —
+        the clmod3-proven path. Never raises; returns success.
+        """
+        base = "a[href*='/products/']"
+        click_sel = "a.card-figure:visible, a.card-title:visible, a.product-title:visible, a[href*='/products/']:visible"
+        try:
+            vis = self.page.locator(click_sel)
+            n = await vis.count()
+            if n > 0:
+                i = random.randint(0, min(n - 1, 15))
+                await vis.nth(i).click(timeout=6000)
+                await self.page.wait_for_load_state("load", timeout=ALLOW_NAV_TIMEOUT)
+                if "/products/" in self.page.url:
+                    return True
+        except Exception:
+            debug_print(self.debug, f"[S{self.id}] product tile click failed; goto fallback")
+        # Fallback: harvest hrefs and navigate directly.
+        try:
+            hrefs = await self.page.eval_on_selector_all(
+                base,
+                "els => [...new Set(els.map(a => a.getAttribute('href')).filter(h => h && h.includes('/products/')))]",
+            )
+        except Exception:
+            hrefs = []
+        if not hrefs:
+            return False
+        href = random.choice(hrefs)
+        url = href if href.startswith("http") else self.origin.rstrip("/") + href
+        try:
+            await self._guarded_goto(url)
+            debug_print(self.debug, f"[S{self.id}] pdp via goto → {url}")
+            return "/products/" in self.page.url
+        except Exception:
+            return False
+
     async def _open_random_pdp(self, count: int = 1):
         count = max(1, min(count, 3))
         for _ in range(count):
             if self.stop_requested:
                 break
-            grid = self.page.locator("a.card-figure, a.card-title, a.product-title, a[href*='/products/']")
-            try:
-                n = await grid.count()
-            except Exception:
-                n = 0
-            if n > 0:
-                i = random.randint(0, min(n-1, 15))
-                await grid.nth(i).click(timeout=SEL_TIMEOUT)
+            if await self._open_product_link():
                 await self._maybe_scroll_page()
                 if self.flag_is_atc_session and self.did_add_to_cart < self.funnel_max_cart_adds:
                     await self._add_to_cart()
@@ -1194,7 +1228,7 @@ class Session:
     async def _click_category_tiles(self, count: int):
         count = max(1, min(count, 3))
         visited: set = set()
-        selector = "a.card-figure, a.card-title, a.product-title, a[href*='/products/']"
+        selector = "a.card-figure:visible, a.card-title:visible, a.product-title:visible, a[href*='/products/']:visible"
         for i in range(count):
             grid = self.page.locator(selector)
             try:
@@ -1215,10 +1249,14 @@ class Session:
                 choice = 0
             visited.add(choice)
             try:
-                await grid.nth(choice).click(timeout=SEL_TIMEOUT)
+                await grid.nth(choice).click(timeout=6000)
                 await self._maybe_scroll_page(prob=0.85, depth_min=0.12, depth_max=0.35, steps_min=1, steps_max=3)
             except Exception:
-                continue
+                # Click failed (hidden/overlaid tile): goto-fallback keeps the
+                # session alive instead of burning the selector timeout budget.
+                if not await self._open_product_link():
+                    continue
+                await self._maybe_scroll_page(prob=0.85, depth_min=0.12, depth_max=0.35, steps_min=1, steps_max=3)
             if i < count - 1:
                 with contextlib.suppress(Exception):
                     await self.page.go_back(timeout=ALLOW_NAV_TIMEOUT, wait_until=self.wait_until)

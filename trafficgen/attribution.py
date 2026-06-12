@@ -139,11 +139,10 @@ async def apply_no_cache(context):
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Pragma": "no-cache",
     })
-
-    async def _bypass_cache(route):
-        headers = {**route.request.headers}
-        headers["Cache-Control"] = "no-cache, no-store"
-        headers["Pragma"] = "no-cache"
-        await route.continue_(headers=headers)
-
-    await context.route("**/*", _bypass_cache)
+    # NOTE: an earlier version also intercepted every request via
+    # context.route("**/*"). Under concurrent sessions that multiplies
+    # Playwright driver round-trips per page load and destabilizes the
+    # browser process ("Connection closed while reading from the driver").
+    # The extra headers above + launch-level cache disabling + blocked
+    # service workers already prevent the CloudFront/Referer cache issue,
+    # so route interception was removed.
