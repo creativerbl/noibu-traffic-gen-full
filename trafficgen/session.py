@@ -410,6 +410,14 @@ class Session:
     async def _run_scripted(self, flow: dict):
         steps = flow.get("steps", [])
         await self._landing()
+        # Funnel-first for persona ATC sessions: do the PDP → add-to-cart →
+        # checkout work while the session budget is fresh; browse afterwards.
+        # (Previously the nav walk + flow steps frequently consumed the whole
+        # session timeout, so atc/checkout never ran.)
+        if self.persona is not None and self.flag_is_atc_session and not self.flag_bounce:
+            await self._open_random_pdp(count=2)  # 2 = one retry if first link isn't a PDP
+            if self.stop_requested:
+                return
         await self._topnav_click_all_with_hotspots()
         for step in steps:
             if self.stop_requested:
@@ -722,7 +730,13 @@ class Session:
             debug_print(self.debug, f"[S{self.id}] top-nav: none found")
             return
         random.shuffle(links)
-        for label_norm, el in links:
+        # Cap the nav walk: clicking EVERY header link at 3-8s per page burned
+        # the whole session budget (240s timeouts) before any PDP/cart step
+        # ran. Funnel-flagged sessions browse 1-2 nav pages, others a few.
+        max_links = int(os.getenv("NAV_MAX_LINKS", "4"))
+        if self.persona is not None and self.flag_is_atc_session:
+            max_links = min(max_links, 2)
+        for label_norm, el in links[:max(1, max_links)]:
             if self.stop_requested:
                 break
             await self._click_nav_el(label_norm, el)
@@ -1040,8 +1054,18 @@ class Session:
         any reason, fall back to harvesting hrefs and navigating directly —
         the clmod3-proven path. Never raises; returns success.
         """
-        base = "a[href*='/products/']"
-        click_sel = "a.card-figure:visible, a.card-title:visible, a.product-title:visible, a[href*='/products/']:visible"
+        # BigCommerce (Cornerstone) product URLs are root-level slugs, NOT
+        # /products/..., so harvest from product CARDS (clmod3-proven
+        # selector set) plus the Shopify-style pattern.
+        harvest_sel = (
+            ".card a.card-figure__link, .card-figure a[href], .card a[href], "
+            "a.card-title, a.product-title, a[href*='/products/']"
+        )
+        click_sel = (
+            "a.card-figure__link:visible, a.card-figure:visible, a.card-title:visible, "
+            "a.product-title:visible, a[href*='/products/']:visible"
+        )
+        start_url = self.page.url
         try:
             vis = self.page.locator(click_sel)
             n = await vis.count()
@@ -1049,26 +1073,30 @@ class Session:
                 i = random.randint(0, min(n - 1, 15))
                 await vis.nth(i).click(timeout=6000)
                 await self.page.wait_for_load_state("load", timeout=ALLOW_NAV_TIMEOUT)
-                if "/products/" in self.page.url:
+                if self.page.url != start_url:
                     return True
         except Exception:
             debug_print(self.debug, f"[S{self.id}] product tile click failed; goto fallback")
         # Fallback: harvest hrefs and navigate directly.
         try:
             hrefs = await self.page.eval_on_selector_all(
-                base,
-                "els => [...new Set(els.map(a => a.getAttribute('href')).filter(h => h && h.includes('/products/')))]",
+                harvest_sel,
+                """els => [...new Set(els.map(a => a.getAttribute('href'))
+                    .filter(h => h && h.length > 1 && !h.startsWith('#')
+                        && !h.includes('cart.php') && !h.includes('compare')
+                        && !h.includes('login') && !h.includes('mailto:')))]""",
             )
         except Exception:
             hrefs = []
         if not hrefs:
+            debug_print(self.debug, f"[S{self.id}] no product links found on {start_url}")
             return False
         href = random.choice(hrefs)
-        url = href if href.startswith("http") else self.origin.rstrip("/") + href
+        url = href if href.startswith("http") else self.origin.rstrip("/") + "/" + href.lstrip("/")
         try:
             await self._guarded_goto(url)
             debug_print(self.debug, f"[S{self.id}] pdp via goto → {url}")
-            return "/products/" in self.page.url
+            return True
         except Exception:
             return False
 
