@@ -16,6 +16,8 @@ from trafficgen.utils import (
     think,
     weighted_value,
 )
+from trafficgen import attribution
+from trafficgen import checkout as checkout_engine
 
 ALLOW_NAV_TIMEOUT = 25000
 SEL_TIMEOUT = 15000
@@ -127,7 +129,9 @@ class Session:
                  global_qps,
                  debug: bool = False,
                  fault_profile: Optional[dict] = None,
-                 referrer_url: Optional[str] = None):
+                 referrer_url: Optional[str] = None,
+                 persona: Optional[Dict[str, Any]] = None,
+                 may_place_order=None):
         self.id = session_id
         self.browser = browser
         self.playwright = playwright
@@ -143,6 +147,8 @@ class Session:
         self.global_qps = global_qps
         self.debug = debug
         self.fault_profile = fault_profile or {}
+        self.persona = persona if isinstance(persona, dict) else None
+        self.may_place_order = may_place_order
         self.flow_weight_overrides = _parse_weight_overrides(os.getenv("FLOW_WEIGHTS", ""))
 
         # UTM source (legacy env choice supplied by Runner)
@@ -207,17 +213,39 @@ class Session:
         self.coverage_allow = [s.strip() for s in os.getenv("COVERAGE_SELECTOR_ALLOW",".hero a,.promo a,.featured a,.card a,button,.btn").split(",") if s.strip()]
         self.coverage_block = [s.strip() for s in os.getenv("COVERAGE_SELECTOR_BLOCK",'[href*="logout"],[href^="mailto:"],[href^="tel:"],[href*="admin"],.social a').split(",") if s.strip()]
 
+        # Device-aware browsing depth. Desktop shoppers browse more products
+        # per session than phone users; mobile stays shallow/quick.
+        self.is_desktop = not bool(self.ctx_args.get("is_mobile", False))
+        _pdp_d_min = int(os.getenv("PDP_VISITS_DESKTOP_MIN", "3"))
+        _pdp_d_max = int(os.getenv("PDP_VISITS_DESKTOP_MAX", "6"))
+        _pdp_m_min = int(os.getenv("PDP_VISITS_MOBILE_MIN", "1"))
+        _pdp_m_max = int(os.getenv("PDP_VISITS_MOBILE_MAX", "2"))
+        self.pdp_visits = (_pdp_d_min, _pdp_d_max) if self.is_desktop else (_pdp_m_min, _pdp_m_max)
+        self.pdp_visit_cap = int(os.getenv("PDP_VISITS_MAX_CAP", "6"))
+
         # Funnel gating
         self.funnel_atc_rate = float(os.getenv("FUNNEL_ADD_TO_CART_RATE","0.30"))
         self.funnel_checkout_rate = float(os.getenv("FUNNEL_CHECKOUT_START_RATE","0.50"))
         self.funnel_max_cart_adds = int(os.getenv("FUNNEL_MAX_CART_ADDS_PER_SESSION","1"))
         self.funnel_max_checkout_starts = int(os.getenv("FUNNEL_MAX_CHECKOUT_STARTS_PER_SESSION","1"))
-        self.flag_is_atc_session = (random.random() < self.funnel_atc_rate)
-        self.flag_should_checkout = (self.flag_is_atc_session and (random.random() < self.funnel_checkout_rate))
+        # Persona funnel probabilities take precedence over FUNNEL_* env rates.
+        persona_funnel = (self.persona or {}).get("funnel")
+        if isinstance(persona_funnel, dict):
+            self.flag_bounce = (random.random() < float(persona_funnel.get("bounce", 0.0) or 0.0))
+            atc_rate = float(persona_funnel.get("add_to_cart", self.funnel_atc_rate) or 0.0)
+            checkout_start_rate = float(persona_funnel.get("checkout_start", self.funnel_checkout_rate) or 0.0)
+        else:
+            self.flag_bounce = False
+            atc_rate = self.funnel_atc_rate
+            checkout_start_rate = self.funnel_checkout_rate
+        self.flag_is_atc_session = (not self.flag_bounce) and (random.random() < atc_rate)
+        self.flag_should_checkout = (self.flag_is_atc_session and (random.random() < checkout_start_rate))
         self.did_add_to_cart = 0
         self.did_start_checkout = 0
+        self.did_complete_checkout = 0
         self.stop_requested = False
         self._apply_flow_weight_overrides()
+        self._apply_persona_flow_overrides()
         self._flow_weights_available = any(isinstance(f, dict) and "weight" in f for f in self.flows)
 
         # Search
@@ -234,7 +262,11 @@ class Session:
         cargs["locale"] = self.locale
         cargs["timezone_id"] = self.tz
         cargs.setdefault("ignore_https_errors", True)
+        # 3-layer no-cache treatment (all sessions): CloudFront varies cache
+        # on Referer; cached cross-referrer responses broke Noibu loading.
+        cargs["service_workers"] = "block"
         self.context = await self.browser.new_context(**cargs)
+        await attribution.apply_no_cache(self.context)
         self.page = await self.context.new_page()
 
     def _apply_flow_weight_overrides(self):
@@ -248,6 +280,29 @@ class Session:
                 continue
             if name in self.flow_weight_overrides:
                 f["weight"] = self.flow_weight_overrides[name]
+
+    def _apply_persona_flow_overrides(self):
+        overrides = (self.persona or {}).get("flow_overrides")
+        if not isinstance(overrides, dict) or not overrides:
+            return
+        norm = {_normalize_label(str(k)): v for k, v in overrides.items()}
+        # Copy flow dicts so per-persona multipliers never mutate shared state.
+        self.flows = [dict(f) if isinstance(f, dict) else f for f in self.flows]
+        for f in self.flows:
+            if not isinstance(f, dict):
+                continue
+            name = _normalize_label(f.get("name") or "")
+            if name not in norm:
+                continue
+            try:
+                mult = max(float(norm[name]), 0.0)
+            except Exception:
+                continue
+            try:
+                base = float(f.get("weight", 1) or 1)
+            except Exception:
+                base = 1.0
+            f["weight"] = base * mult
 
     def _pick_flow(self) -> Optional[dict]:
         if not self.flows:
@@ -347,21 +402,56 @@ class Session:
                 raise last_exc
             raise RuntimeError("browser context creation failed")
         try:
+            if self.persona is not None and self.flag_bounce:
+                await self._bounce_session()
+                return
             flow = self._pick_flow()
             if not flow:
                 return
             await self._run_scripted(flow)
         finally:
-            debug_print(self.debug, f"[S{self.id}] summary: atc={self.did_add_to_cart} checkout={self.did_start_checkout}")
+            debug_print(self.debug, f"[S{self.id}] summary: atc={self.did_add_to_cart} checkout={self.did_start_checkout} completed={self.did_complete_checkout}")
             if self.context:
                 with contextlib.suppress(Exception):
                     await self.context.close()
             self.context = None
             self.page = None
 
+    def _pdp_visit_count(self) -> int:
+        """How many products to browse this session (device-aware)."""
+        lo, hi = self.pdp_visits
+        return random.randint(min(lo, hi), max(lo, hi))
+
+    async def _desktop_extra_browse(self):
+        """Desktop-only: after the main flow, browse a few more products,
+        returning to a listing between PDPs so the journey spans several
+        products instead of ending on the first one."""
+        visits = self._pdp_visit_count()
+        debug_print(self.debug, f"[S{self.id}] desktop extra browse: up to {visits} products")
+        for _ in range(visits):
+            if self.stop_requested:
+                break
+            with contextlib.suppress(Exception):
+                await self._open_random_category({})
+            if self.stop_requested:
+                break
+            if not await self._open_product_link():
+                break
+            await self._maybe_scroll_page(prob=0.85, depth_min=0.2, depth_max=0.6, steps_min=2, steps_max=5)
+            await self._post_load_idle_pause()
+            await think(self.think_cfg["page_min_ms"], self.think_cfg["page_max_ms"])
+
     async def _run_scripted(self, flow: dict):
         steps = flow.get("steps", [])
         await self._landing()
+        # Funnel-first for persona ATC sessions: do the PDP → add-to-cart →
+        # checkout work while the session budget is fresh; browse afterwards.
+        # (Previously the nav walk + flow steps frequently consumed the whole
+        # session timeout, so atc/checkout never ran.)
+        if self.persona is not None and self.flag_is_atc_session and not self.flag_bounce:
+            await self._open_random_pdp(count=2)  # 2 = one retry if first link isn't a PDP
+            if self.stop_requested:
+                return
         await self._topnav_click_all_with_hotspots()
         for step in steps:
             if self.stop_requested:
@@ -375,8 +465,34 @@ class Session:
             await think(self.think_cfg["page_min_ms"], self.think_cfg["page_max_ms"])
         if (not self.stop_requested) and random.random() < self.coverage_prob:
             await self._coverage_click_pass()
+        # Desktop shoppers keep browsing more products after the scripted flow.
+        if self.is_desktop and (not self.stop_requested) and not self.flag_bounce:
+            await self._desktop_extra_browse()
+
+    async def _bounce_session(self):
+        """Persona bounce: land, glance (light/no scroll), dwell 3-10s, leave."""
+        landing = attribution.landing_url(self.origin, self.persona)
+        referer_hdr = attribution.referer_header(self.persona)
+        debug_print(self.debug, f"[S{self.id}] persona '{(self.persona or {}).get('name')}' BOUNCE landing: {landing} | referer={referer_hdr or 'none'}")
+        await self._guarded_goto(landing, referer=referer_hdr)
+        await self._maybe_scroll_page(prob=0.35, depth_min=0.05, depth_max=0.25, steps_min=1, steps_max=2)
+        await asyncio.sleep(random.uniform(3.0, 10.0))
 
     async def _landing(self):
+        # Persona attribution takes precedence over legacy REFERRER_* env logic.
+        if self.persona is not None:
+            landing = attribution.landing_url(self.origin, self.persona)
+            referer_hdr = attribution.referer_header(self.persona)
+            debug_print(self.debug, f"[S{self.id}] persona '{self.persona.get('name')}' landing: {landing} | referer={referer_hdr or 'none'}")
+            await self._guarded_goto(landing, referer=referer_hdr)
+            try:
+                ref = await self.page.evaluate("document.referrer")
+                debug_print(self.debug, f"[S{self.id}] document.referrer='{ref}'")
+            except Exception:
+                pass
+            await self._maybe_scroll_page()
+            return
+
         landing = self.origin + "/"
         referer_hdr: Optional[str] = None
 
@@ -651,7 +767,13 @@ class Session:
             debug_print(self.debug, f"[S{self.id}] top-nav: none found")
             return
         random.shuffle(links)
-        for label_norm, el in links:
+        # Cap the nav walk: clicking EVERY header link at 3-8s per page burned
+        # the whole session budget (240s timeouts) before any PDP/cart step
+        # ran. Funnel-flagged sessions browse 1-2 nav pages, others a few.
+        max_links = int(os.getenv("NAV_MAX_LINKS", "4"))
+        if self.persona is not None and self.flag_is_atc_session:
+            max_links = min(max_links, 2)
+        for label_norm, el in links[:max(1, max_links)]:
             if self.stop_requested:
                 break
             await self._click_nav_el(label_norm, el)
@@ -960,19 +1082,67 @@ class Session:
                 return
         await self._maybe_scroll_page()
 
+    async def _open_product_link(self) -> bool:
+        """Open a random product page robustly.
+
+        Try a human-like click on a VISIBLE product link first (themes such
+        as Dawn render a hidden 0x0 duplicate of every card link, which makes
+        index-based clicks hang on visibility checks). If the click fails for
+        any reason, fall back to harvesting hrefs and navigating directly —
+        the clmod3-proven path. Never raises; returns success.
+        """
+        # BigCommerce (Cornerstone) product URLs are root-level slugs, NOT
+        # /products/..., so harvest from product CARDS (clmod3-proven
+        # selector set) plus the Shopify-style pattern.
+        harvest_sel = (
+            ".card a.card-figure__link, .card-figure a[href], .card a[href], "
+            "a.card-title, a.product-title, a[href*='/products/']"
+        )
+        click_sel = (
+            "a.card-figure__link:visible, a.card-figure:visible, a.card-title:visible, "
+            "a.product-title:visible, a[href*='/products/']:visible"
+        )
+        start_url = self.page.url
+        try:
+            vis = self.page.locator(click_sel)
+            n = await vis.count()
+            if n > 0:
+                i = random.randint(0, min(n - 1, 15))
+                await vis.nth(i).click(timeout=6000)
+                await self.page.wait_for_load_state("load", timeout=ALLOW_NAV_TIMEOUT)
+                if self.page.url != start_url:
+                    return True
+        except Exception:
+            debug_print(self.debug, f"[S{self.id}] product tile click failed; goto fallback")
+        # Fallback: harvest hrefs and navigate directly.
+        try:
+            hrefs = await self.page.eval_on_selector_all(
+                harvest_sel,
+                """els => [...new Set(els.map(a => a.getAttribute('href'))
+                    .filter(h => h && h.length > 1 && !h.startsWith('#')
+                        && !h.includes('cart.php') && !h.includes('compare')
+                        && !h.includes('login') && !h.includes('mailto:')))]""",
+            )
+        except Exception:
+            hrefs = []
+        if not hrefs:
+            debug_print(self.debug, f"[S{self.id}] no product links found on {start_url}")
+            return False
+        href = random.choice(hrefs)
+        url = href if href.startswith("http") else self.origin.rstrip("/") + "/" + href.lstrip("/")
+        try:
+            await self._guarded_goto(url)
+            debug_print(self.debug, f"[S{self.id}] pdp via goto → {url}")
+            return True
+        except Exception:
+            return False
+
     async def _open_random_pdp(self, count: int = 1):
-        count = max(1, min(count, 3))
+        count = max(1, min(count, self.pdp_visit_cap))
         for _ in range(count):
             if self.stop_requested:
                 break
-            grid = self.page.locator("a.card-figure, a.card-title, a.product-title, a[href*='/products/']")
-            try:
-                n = await grid.count()
-            except Exception:
-                n = 0
-            if n > 0:
-                i = random.randint(0, min(n-1, 15))
-                await grid.nth(i).click(timeout=SEL_TIMEOUT)
+            if await self._open_product_link():
                 await self._maybe_scroll_page()
                 if self.flag_is_atc_session and self.did_add_to_cart < self.funnel_max_cart_adds:
                     await self._add_to_cart()
@@ -1121,9 +1291,9 @@ class Session:
                 continue
 
     async def _click_category_tiles(self, count: int):
-        count = max(1, min(count, 3))
+        count = max(1, min(count, self.pdp_visit_cap))
         visited: set = set()
-        selector = "a.card-figure, a.card-title, a.product-title, a[href*='/products/']"
+        selector = "a.card-figure:visible, a.card-title:visible, a.product-title:visible, a[href*='/products/']:visible"
         for i in range(count):
             grid = self.page.locator(selector)
             try:
@@ -1144,10 +1314,14 @@ class Session:
                 choice = 0
             visited.add(choice)
             try:
-                await grid.nth(choice).click(timeout=SEL_TIMEOUT)
+                await grid.nth(choice).click(timeout=6000)
                 await self._maybe_scroll_page(prob=0.85, depth_min=0.12, depth_max=0.35, steps_min=1, steps_max=3)
             except Exception:
-                continue
+                # Click failed (hidden/overlaid tile): goto-fallback keeps the
+                # session alive instead of burning the selector timeout budget.
+                if not await self._open_product_link():
+                    continue
+                await self._maybe_scroll_page(prob=0.85, depth_min=0.12, depth_max=0.35, steps_min=1, steps_max=3)
             if i < count - 1:
                 with contextlib.suppress(Exception):
                     await self.page.go_back(timeout=ALLOW_NAV_TIMEOUT, wait_until=self.wait_until)
@@ -1170,7 +1344,7 @@ class Session:
         )
         if random.random() < max(0.0, min(1.0, self.tile_hover_prob)):
             await self._hover_category_tiles(hover_count)
-        await self._click_category_tiles(random.randint(1, 3))
+        await self._click_category_tiles(self._pdp_visit_count())
 
     async def _category_hotspot_click(self, step: dict):
         if any(k in (step or {}) for k in ("category", "categories", "category_name")):
@@ -1460,8 +1634,60 @@ class Session:
                     continue
         await self._maybe_scroll_page(prob=0.4, depth_min=0.08, depth_max=0.2, steps_min=1, steps_max=2)
 
+    async def _persona_checkout(self):
+        """Persona-driven checkout: proceed, then complete or abandon.
+
+        Completion requires the persona's checkout_complete roll AND the
+        global order rate limiter (may_place_order). Denied/failed rolls
+        abandon at a weighted random stage instead.
+        """
+        if self.did_start_checkout >= self.funnel_max_checkout_starts:
+            return
+        if not self.flag_should_checkout or self.did_add_to_cart <= 0:
+            return
+        funnel = (self.persona or {}).get("funnel") or {}
+        if not await checkout_engine.proceed_to_checkout(self.page, debug=self.debug):
+            return
+        self.did_start_checkout += 1
+        complete = random.random() < float(funnel.get("checkout_complete", 0.0) or 0.0)
+        forced_stage: Optional[str] = None
+        if complete:
+            allowed = True
+            if self.may_place_order is not None:
+                allowed = await self.may_place_order()
+            if not allowed:
+                debug_print(self.debug, f"[S{self.id}] order rate limit active; abandoning at payment instead")
+                complete = False
+                forced_stage = "payment"
+        if complete:
+            identity = checkout_engine.random_identity()
+            card = {
+                "number": os.getenv("CARD_NUMBER", "4111111111111111"),
+                "expiry": os.getenv("CARD_EXPIRY", "01/30"),
+                "cvv": os.getenv("CARD_CVV", "989"),
+            }
+            if await checkout_engine.complete_checkout(self.page, identity, card, debug=self.debug):
+                self.did_complete_checkout += 1
+                debug_print(self.debug, f"[S{self.id}] checkout COMPLETED")
+            else:
+                debug_print(self.debug, f"[S{self.id}] checkout completion failed")
+        else:
+            stage = forced_stage
+            if stage is None:
+                picked = choose_weighted([
+                    {"stage": "customer", "weight": 0.2},
+                    {"stage": "shipping", "weight": 0.3},
+                    {"stage": "payment", "weight": 0.5},
+                ], key="weight") or {}
+                stage = picked.get("stage", "payment")
+            await checkout_engine.abandon_checkout(self.page, stage, debug=self.debug)
+        self.stop_requested = True
+
     async def _start_checkout(self):
         if self.did_start_checkout >= self.funnel_max_checkout_starts:
+            return
+        if self.persona is not None:
+            await self._persona_checkout()
             return
         try:
             btn = self.page.get_by_role("link", name=re.compile("checkout", re.I))
