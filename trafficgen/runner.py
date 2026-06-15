@@ -132,6 +132,14 @@ class Runner:
         self._session_timeout = self._parse_float_env(
             "SESSION_MAX_SECONDS", default=default_timeout, minimum=30.0
         )
+        # Desktop shoppers browse longer than phone users; give their sessions a
+        # larger time budget so they can visit several products before timing out.
+        self._desktop_session_mult = self._parse_float_env(
+            "DESKTOP_SESSION_MULT", default=2.0, minimum=1.0
+        )
+        self._mobile_session_mult = self._parse_float_env(
+            "MOBILE_SESSION_MULT", default=1.0, minimum=0.25
+        )
 
         default_refresh_sessions = max(
             50, int(self.cfg.sessions_per_minute * avg_minutes * 2) or 50
@@ -346,6 +354,10 @@ class Runner:
         record_metrics = True
         try:
             dev = pick_device(device_pool, pw)
+            _is_desktop = not bool(dev["context_args"].get("is_mobile", False))
+            _session_timeout = self._session_timeout * (
+                self._desktop_session_mult if _is_desktop else self._mobile_session_mult
+            )
             import random as _random
             locale = _random.choice(self.cfg.locales or ["en-US"])
             tz = _random.choice(self.cfg.timezones or ["America/Toronto"])
@@ -372,13 +384,13 @@ class Runner:
                 may_place_order=self.order_limiter.may_place_order,
             )
             try:
-                await asyncio.wait_for(s.run(), timeout=self._session_timeout)
+                await asyncio.wait_for(s.run(), timeout=_session_timeout)
                 success = True
             except asyncio.TimeoutError:
                 timed_out = True
                 debug_print(
                     self.cfg.debug,
-                    f"[session {sid}] timed out after {self._session_timeout:.1f}s",
+                    f"[session {sid}] timed out after {_session_timeout:.1f}s",
                 )
         except asyncio.CancelledError:
             record_metrics = False

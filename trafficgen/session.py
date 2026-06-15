@@ -213,6 +213,16 @@ class Session:
         self.coverage_allow = [s.strip() for s in os.getenv("COVERAGE_SELECTOR_ALLOW",".hero a,.promo a,.featured a,.card a,button,.btn").split(",") if s.strip()]
         self.coverage_block = [s.strip() for s in os.getenv("COVERAGE_SELECTOR_BLOCK",'[href*="logout"],[href^="mailto:"],[href^="tel:"],[href*="admin"],.social a').split(",") if s.strip()]
 
+        # Device-aware browsing depth. Desktop shoppers browse more products
+        # per session than phone users; mobile stays shallow/quick.
+        self.is_desktop = not bool(self.ctx_args.get("is_mobile", False))
+        _pdp_d_min = int(os.getenv("PDP_VISITS_DESKTOP_MIN", "3"))
+        _pdp_d_max = int(os.getenv("PDP_VISITS_DESKTOP_MAX", "6"))
+        _pdp_m_min = int(os.getenv("PDP_VISITS_MOBILE_MIN", "1"))
+        _pdp_m_max = int(os.getenv("PDP_VISITS_MOBILE_MAX", "2"))
+        self.pdp_visits = (_pdp_d_min, _pdp_d_max) if self.is_desktop else (_pdp_m_min, _pdp_m_max)
+        self.pdp_visit_cap = int(os.getenv("PDP_VISITS_MAX_CAP", "6"))
+
         # Funnel gating
         self.funnel_atc_rate = float(os.getenv("FUNNEL_ADD_TO_CART_RATE","0.30"))
         self.funnel_checkout_rate = float(os.getenv("FUNNEL_CHECKOUT_START_RATE","0.50"))
@@ -407,6 +417,30 @@ class Session:
             self.context = None
             self.page = None
 
+    def _pdp_visit_count(self) -> int:
+        """How many products to browse this session (device-aware)."""
+        lo, hi = self.pdp_visits
+        return random.randint(min(lo, hi), max(lo, hi))
+
+    async def _desktop_extra_browse(self):
+        """Desktop-only: after the main flow, browse a few more products,
+        returning to a listing between PDPs so the journey spans several
+        products instead of ending on the first one."""
+        visits = self._pdp_visit_count()
+        debug_print(self.debug, f"[S{self.id}] desktop extra browse: up to {visits} products")
+        for _ in range(visits):
+            if self.stop_requested:
+                break
+            with contextlib.suppress(Exception):
+                await self._open_random_category({})
+            if self.stop_requested:
+                break
+            if not await self._open_product_link():
+                break
+            await self._maybe_scroll_page(prob=0.85, depth_min=0.2, depth_max=0.6, steps_min=2, steps_max=5)
+            await self._post_load_idle_pause()
+            await think(self.think_cfg["page_min_ms"], self.think_cfg["page_max_ms"])
+
     async def _run_scripted(self, flow: dict):
         steps = flow.get("steps", [])
         await self._landing()
@@ -431,6 +465,9 @@ class Session:
             await think(self.think_cfg["page_min_ms"], self.think_cfg["page_max_ms"])
         if (not self.stop_requested) and random.random() < self.coverage_prob:
             await self._coverage_click_pass()
+        # Desktop shoppers keep browsing more products after the scripted flow.
+        if self.is_desktop and (not self.stop_requested) and not self.flag_bounce:
+            await self._desktop_extra_browse()
 
     async def _bounce_session(self):
         """Persona bounce: land, glance (light/no scroll), dwell 3-10s, leave."""
@@ -1101,7 +1138,7 @@ class Session:
             return False
 
     async def _open_random_pdp(self, count: int = 1):
-        count = max(1, min(count, 3))
+        count = max(1, min(count, self.pdp_visit_cap))
         for _ in range(count):
             if self.stop_requested:
                 break
@@ -1254,7 +1291,7 @@ class Session:
                 continue
 
     async def _click_category_tiles(self, count: int):
-        count = max(1, min(count, 3))
+        count = max(1, min(count, self.pdp_visit_cap))
         visited: set = set()
         selector = "a.card-figure:visible, a.card-title:visible, a.product-title:visible, a[href*='/products/']:visible"
         for i in range(count):
@@ -1307,7 +1344,7 @@ class Session:
         )
         if random.random() < max(0.0, min(1.0, self.tile_hover_prob)):
             await self._hover_category_tiles(hover_count)
-        await self._click_category_tiles(random.randint(1, 3))
+        await self._click_category_tiles(self._pdp_visit_count())
 
     async def _category_hotspot_click(self, step: dict):
         if any(k in (step or {}) for k in ("category", "categories", "category_name")):
