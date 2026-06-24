@@ -786,10 +786,14 @@ class Session:
         pool = list(links)
         chosen = []
         while pool and len(chosen) < k:
-            weights = [
-                max(0.0001, self.nav_weights.get(lbl, self.nav_link_default_weight))
-                for (lbl, _el) in pool
-            ]
+            weights = []
+            for (lbl, _el) in pool:
+                raw = self.nav_weights.get(lbl, self.nav_link_default_weight)
+                try:
+                    w = float(raw)  # NAV_CATEGORY_WEIGHTS parse as strings
+                except (TypeError, ValueError):
+                    w = self.nav_link_default_weight
+                weights.append(max(0.0001, w))
             total = sum(weights)
             r = random.uniform(0, total)
             upto = 0.0
