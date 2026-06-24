@@ -18,6 +18,16 @@ DEVICE_MAP = {
     "desktop-firefox": None,
 }
 
+
+def _jitter_viewport(width, height, *, wj=40, hj=120):
+    """Vary viewport dims per session so scroll-depth ratios (depth/height)
+    don't collapse to identical values across sessions — a synthetic
+    fingerprint in Noibu scrollmaps."""
+    return {
+        "width": int(width + random.randint(-wj, wj)),
+        "height": int(height + random.randint(-hj, hj)),
+    }
+
 def build_device_pool(device_mix):
     pool = []
     for item in device_mix:
@@ -45,7 +55,7 @@ def pick_device(pool, playwright):
     else:
         if chosen.name == "desktop-chrome":
             context_args.update({
-                "viewport": {"width": 1366, "height": 864},
+                "viewport": _jitter_viewport(1366, 864),
                 "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                               "(KHTML, like Gecko) Chrome/122 Safari/537.36",
                 "is_mobile": False,
@@ -54,7 +64,7 @@ def pick_device(pool, playwright):
             })
         elif chosen.name == "desktop-edge":
             context_args.update({
-                "viewport": {"width": 1440, "height": 900},
+                "viewport": _jitter_viewport(1440, 900),
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                               "AppleWebKit/537.36 (KHTML, like Gecko) "
                               "Chrome/120 Safari/537.36 Edg/120",
@@ -64,7 +74,7 @@ def pick_device(pool, playwright):
             })
         elif chosen.name == "desktop-safari":
             context_args.update({
-                "viewport": {"width": 1440, "height": 900},
+                "viewport": _jitter_viewport(1440, 900),
                 "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                               "AppleWebKit/605.1.15 (KHTML, like Gecko) "
                               "Version/17.0 Safari/605.1.15",
@@ -74,7 +84,7 @@ def pick_device(pool, playwright):
             })
         elif chosen.name == "desktop-firefox":
             context_args.update({
-                "viewport": {"width": 1366, "height": 864},
+                "viewport": _jitter_viewport(1366, 864),
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) "
                               "Gecko/20100101 Firefox/120.0",
                 "is_mobile": False,
@@ -82,5 +92,5 @@ def pick_device(pool, playwright):
                 "device_scale_factor": 1.0,
             })
         else:
-            context_args.update({"viewport": {"width": 1280, "height": 800}})
+            context_args.update({"viewport": _jitter_viewport(1280, 800)})
     return {"context_args": context_args}

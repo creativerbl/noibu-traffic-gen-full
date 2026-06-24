@@ -249,6 +249,14 @@ class Session:
         self._flow_weights_available = any(isinstance(f, dict) and "weight" in f for f in self.flows)
 
         # Search
+        # Heatmap-realism knobs (homepage behavior, device-aware)
+        self.search_run_prob = float(os.getenv("SEARCH_RUN_PROB", "0.5"))
+        self.nav_link_default_weight = float(os.getenv("NAV_LINK_DEFAULT_WEIGHT", "2"))
+        self.home_product_click_prob = float(os.getenv("HOME_PRODUCT_CLICK_PROB", "0.7"))
+        self.home_product_clicks_min = int(os.getenv("HOME_PRODUCT_CLICKS_MIN", "1"))
+        self.home_product_clicks_max = int(os.getenv("HOME_PRODUCT_CLICKS_MAX", "3"))
+        self.hero_click_prob = float(os.getenv("HERO_CLICK_PROB", "0.15"))
+        self.mobile_menu_open_prob = float(os.getenv("MOBILE_MENU_OPEN_PROB", "0.75"))
         self.search_terms = _parse_list_csv(os.getenv(
             "SEARCH_TERMS",
             "faucet,sink,shower,towel,mirror,lighting,vanity,fixture,soap,kitchen,bathroom,storage,rug,mat",
@@ -378,8 +386,11 @@ class Session:
         depth_frac = max(0.0, min(1.0, random.uniform(depth_min, depth_max)))
         target = max(400, height * depth_frac)
         steps = max(1, min(10, random.randint(steps_min, steps_max)))
+        # Jitter each wheel delta so sessions don't all stop at identical
+        # scroll ratios (a synthetic fingerprint in the scrollmap).
+        base = target / steps
         for _ in range(steps):
-            await self.page.mouse.wheel(0, target/steps)
+            await self.page.mouse.wheel(0, base * random.uniform(0.75, 1.25))
             await think(self.think_cfg["scroll_min_ms"], self.think_cfg["scroll_max_ms"])
 
     async def run(self):
@@ -452,6 +463,13 @@ class Session:
             await self._open_random_pdp(count=2)  # 2 = one retry if first link isn't a PDP
             if self.stop_requested:
                 return
+        # Homepage product engagement: real users click product tiles on the
+        # home page. Desktop previously generated ZERO product clicks here
+        # (it reached PDPs via direct goto), so the homepage clickmap showed
+        # only nav. Click visible tiles on the landing page so they register.
+        if (not self.stop_requested) and not self.flag_bounce \
+                and random.random() < self.home_product_click_prob:
+            await self._homepage_product_clicks()
         await self._topnav_click_all_with_hotspots()
         for step in steps:
             if self.stop_requested:
@@ -761,19 +779,94 @@ class Session:
             out.append((key, el))
         return out
 
+    def _weighted_sample_links(self, links, k):
+        """Pick up to k nav links weighted by NAV_CATEGORY_WEIGHTS so a few
+        categories (Kitchen/Bath/Shop All) dominate the header heatmap instead
+        of every link getting near-uniform clicks (a synthetic fingerprint)."""
+        pool = list(links)
+        chosen = []
+        while pool and len(chosen) < k:
+            weights = [
+                max(0.0001, self.nav_weights.get(lbl, self.nav_link_default_weight))
+                for (lbl, _el) in pool
+            ]
+            total = sum(weights)
+            r = random.uniform(0, total)
+            upto = 0.0
+            idx = 0
+            for i, w in enumerate(weights):
+                upto += w
+                if r <= upto:
+                    idx = i
+                    break
+            chosen.append(pool.pop(idx))
+        return chosen
+
+    async def _open_mobile_menu(self) -> bool:
+        """Tap the hamburger so the mobile nav drawer is interactable."""
+        selectors = [
+            "a.mobileMenu-toggle", "button.mobileMenu-toggle", ".mobileMenu-toggle",
+            "[class*='mobileMenu-toggle']", "[aria-label*='menu' i]", "#menu",
+        ]
+        for sel in selectors:
+            loc = self.page.locator(sel).first
+            try:
+                if await loc.is_visible(timeout=1200):
+                    await loc.click(timeout=SEL_TIMEOUT)
+                    debug_print(self.debug, f"[S{self.id}] mobile menu opened ({sel})")
+                    await asyncio.sleep(random.uniform(0.4, 1.0))
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _maybe_click_hero(self):
+        """Occasionally click the hero banner / its CTA (dead in synthetic data)."""
+        if random.random() >= self.hero_click_prob:
+            return
+        for sel in [
+            "a.heroCarousel-action", "a.heroCarousel-action.button",
+            ".heroCarousel-slide a", "img.heroCarousel-image",
+        ]:
+            loc = self.page.locator(sel).first
+            try:
+                if await loc.is_visible(timeout=1000):
+                    await loc.click(timeout=SEL_TIMEOUT)
+                    debug_print(self.debug, f"[S{self.id}] hero click → {sel}")
+                    await self._maybe_scroll_page(prob=0.5, depth_min=0.1, depth_max=0.4, steps_min=1, steps_max=3)
+                    return
+            except Exception:
+                continue
+
     async def _topnav_click_all_with_hotspots(self):
+        # Mobile: the header nav lives behind a hamburger. Open it first, then
+        # click categories inside; otherwise mobile generates ZERO menu clicks.
+        if not self.is_desktop:
+            await self._maybe_click_hero()
+            if self.stop_requested:
+                return
+            if random.random() < self.mobile_menu_open_prob:
+                opened = await self._open_mobile_menu()
+                if opened:
+                    links = await self._query_top_nav_links()
+                    if links:
+                        max_links = min(int(os.getenv("NAV_MAX_LINKS", "4")), 3)
+                        for label_norm, el in self._weighted_sample_links(links, max_links):
+                            if self.stop_requested:
+                                break
+                            await self._click_nav_el(label_norm, el)
+            return
+
         links = await self._query_top_nav_links()
         if not links:
             debug_print(self.debug, f"[S{self.id}] top-nav: none found")
             return
-        random.shuffle(links)
-        # Cap the nav walk: clicking EVERY header link at 3-8s per page burned
-        # the whole session budget (240s timeouts) before any PDP/cart step
-        # ran. Funnel-flagged sessions browse 1-2 nav pages, others a few.
+        # Cap the nav walk and WEIGHT it: most sessions hit Kitchen/Bath/Shop
+        # All, long-tail links rarely — instead of a uniform walk over all links.
         max_links = int(os.getenv("NAV_MAX_LINKS", "4"))
         if self.persona is not None and self.flag_is_atc_session:
             max_links = min(max_links, 2)
-        for label_norm, el in links[:max(1, max_links)]:
+        for label_norm, el in self._weighted_sample_links(links, max(1, max_links)):
             if self.stop_requested:
                 break
             await self._click_nav_el(label_norm, el)
@@ -999,6 +1092,11 @@ class Session:
             return
 
     async def _search(self, step: Optional[dict] = None):
+        # Not every search-flow session should open the search overlay; the
+        # overlay container was getting clicked nearly every session (heat blob).
+        if random.random() >= self.search_run_prob:
+            debug_print(self.debug, f"[S{self.id}] search skipped (prob)")
+            return
         term = self._pick_search_term(step)
         input_el = await self._find_search_input()
         if input_el is None:
@@ -1136,6 +1234,44 @@ class Session:
             return True
         except Exception:
             return False
+
+    async def _homepage_product_clicks(self):
+        """Click visible product tiles on the CURRENT (home) page so product
+        clicks register on '/' (the homepage clickmap was nav-only before)."""
+        n = random.randint(min(self.home_product_clicks_min, self.home_product_clicks_max),
+                            max(self.home_product_clicks_min, self.home_product_clicks_max))
+        click_sel = (
+            "ul.productGrid a.card-figure__link:visible, "
+            ".productCarousel-slide a.card-figure__link:visible, "
+            "a.card-figure__link:visible, a.card-title:visible"
+        )
+        start_url = self.page.url
+        for _ in range(n):
+            if self.stop_requested:
+                break
+            try:
+                tiles = self.page.locator(click_sel)
+                total = await tiles.count()
+            except Exception:
+                total = 0
+            if total <= 0:
+                break
+            idx = random.randint(0, min(total - 1, 19))
+            try:
+                await tiles.nth(idx).click(timeout=6000)
+                await self.page.wait_for_load_state("load", timeout=ALLOW_NAV_TIMEOUT)
+                debug_print(self.debug, f"[S{self.id}] home product click #{idx}")
+                await self._maybe_scroll_page(prob=0.7, depth_min=0.15, depth_max=0.5, steps_min=1, steps_max=4)
+                await self._post_load_idle_pause()
+            except Exception:
+                debug_print(self.debug, f"[S{self.id}] home product click failed")
+                break
+            # Back to the homepage to click another tile (keeps heat on '/').
+            with contextlib.suppress(Exception):
+                await self.page.go_back(timeout=ALLOW_NAV_TIMEOUT, wait_until=self.wait_until)
+                await asyncio.sleep(random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000))
+            if self.page.url == start_url:
+                continue
 
     async def _open_random_pdp(self, count: int = 1):
         count = max(1, min(count, self.pdp_visit_cap))
