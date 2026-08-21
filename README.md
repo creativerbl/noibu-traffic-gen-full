@@ -127,3 +127,49 @@ noibu-traffic-gen.sh     # Helper script to install/run (chmod +x and execute)
 
 ## 📄 License
 MIT
+
+---
+
+## Branch: `broken-checkout`
+
+This branch runs **one scenario only** — a low-frequency probe that walks a
+shopper into a checkout that cannot complete, so Noibu captures the failure
+and the retry behaviour around it.
+
+**What one session does**
+
+1. Lands on the store (legacy referrer/UTM attribution — personas are off).
+2. Adds **3 random products** to the cart, re-entering a category listing
+   before each one so every add is a fresh navigation.
+3. Views the cart and proceeds to checkout.
+4. Fills email + shipping, then selects an **offline payment method** —
+   randomly **Bank Deposit** or **Cash on Delivery**. These have no card
+   iframes, so the failure surfaces on order submission.
+5. Clicks **Place Order**. When it fails, waits **5–20s** and clicks again,
+   for **1–7 retries** (so 2–8 total submissions), then leaves.
+
+**Cadence and devices**
+
+* `SESSIONS_PER_MINUTE=0.0166667` → one session per hour (±5% jitter).
+* `MAX_CONCURRENCY=1` → hourly sessions can never overlap.
+* `DEVICE_MIX=desktop-chrome:50,android-chrome:50` → Chrome only, ~50/50
+  desktop and mobile.
+
+**Knobs** (all in `.env`)
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BROKEN_CHECKOUT_PRODUCTS` | `3` | Products added before checkout |
+| `BROKEN_CHECKOUT_PAYMENT_METHODS` | `bank,cod` | Pool picked from per session |
+| `BROKEN_CHECKOUT_RETRY_MIN` / `_MAX` | `1` / `7` | Retries *after* the first failure |
+| `BROKEN_CHECKOUT_RETRY_WAIT_MIN_S` / `_MAX_S` | `5` / `20` | Pause between attempts |
+| `FLOWS_ONLY` | `broken-checkout` | Restricts flow loading to these YAML stems |
+| `SCHEDULER_JITTER` | `0.15` | Fraction of jitter on the scheduling interval |
+| `SCHEDULER_START_IMMEDIATELY` | `0` | `1` fires the first session at boot instead of one interval later |
+
+If the order ever *does* go through, the loop stops after that submission —
+the retry count is a ceiling, not a fixed number of clicks.
+
+**Note:** `SESSIONS_PER_MINUTE` below `0.1` used to be silently clamped by the
+scheduler to a 10-minute interval. That floor is fixed on this branch, so
+sub-hourly rates now mean what they say.

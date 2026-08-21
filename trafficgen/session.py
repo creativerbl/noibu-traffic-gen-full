@@ -248,6 +248,23 @@ class Session:
         self._apply_persona_flow_overrides()
         self._flow_weights_available = any(isinstance(f, dict) and "weight" in f for f in self.flows)
 
+        # ── Broken-checkout scenario (see trafficgen/flows/broken-checkout.yaml)
+        # One low-frequency session that fills a cart, enters checkout with an
+        # OFFLINE payment method (bank deposit / cash on delivery), fails to
+        # place the order, retries a random number of times, then leaves.
+        self.bc_products = max(1, int(os.getenv("BROKEN_CHECKOUT_PRODUCTS", "3")))
+        self.bc_methods = [
+            m.strip() for m in os.getenv(
+                "BROKEN_CHECKOUT_PAYMENT_METHODS", "bank,cod"
+            ).split(",") if m.strip()
+        ] or ["bank", "cod"]
+        self.bc_retry_min = max(0, int(os.getenv("BROKEN_CHECKOUT_RETRY_MIN", "1")))
+        self.bc_retry_max = max(
+            self.bc_retry_min, int(os.getenv("BROKEN_CHECKOUT_RETRY_MAX", "7"))
+        )
+        self.bc_wait_min = float(os.getenv("BROKEN_CHECKOUT_RETRY_WAIT_MIN_S", "5"))
+        self.bc_wait_max = float(os.getenv("BROKEN_CHECKOUT_RETRY_WAIT_MAX_S", "20"))
+
         # Search
         self.search_terms = _parse_list_csv(os.getenv(
             "SEARCH_TERMS",
@@ -452,7 +469,10 @@ class Session:
             await self._open_random_pdp(count=2)  # 2 = one retry if first link isn't a PDP
             if self.stop_requested:
                 return
-        await self._topnav_click_all_with_hotspots()
+        # A flow can opt out of the header walk (the broken-checkout scenario
+        # needs its whole time budget for the cart + retry loop).
+        if not bool(flow.get("skip_nav_walk", False)):
+            await self._topnav_click_all_with_hotspots()
         for step in steps:
             if self.stop_requested:
                 break
@@ -620,6 +640,8 @@ class Session:
             await self._start_checkout()
         elif kind == "checkout_start":
             await self._checkout_start()
+        elif kind == "broken_checkout":
+            await self._broken_checkout(step)
         elif kind == "content_browse":
             await self._content_browse(step)
         elif kind == "content_page":
@@ -1379,22 +1401,29 @@ class Session:
         if random.random() < filter_prob:
             await self._apply_category_filters(1)
 
-    async def _add_to_cart(self):
-        if self.did_add_to_cart >= self.funnel_max_cart_adds:
-            return
+    async def _add_to_cart(self, force: bool = False) -> bool:
+        """Click add-to-cart on the current PDP. Returns True when it clicked.
+
+        `force=True` bypasses FUNNEL_MAX_CART_ADDS_PER_SESSION — used by the
+        broken-checkout scenario, which deliberately builds a multi-item cart.
+        """
+        if (not force) and self.did_add_to_cart >= self.funnel_max_cart_adds:
+            return False
         try:
             btn = self.page.get_by_role("button", name=re.compile("add to cart", re.I))
             await btn.first.click(timeout=SEL_TIMEOUT)
             self.did_add_to_cart += 1
-            return
+            await think(800, 1800)  # let the cart-preview modal render
+            return True
         except Exception:
             pass
         try:
             await self.page.click("button#form-action-addToCart, button[name='add']", timeout=SEL_TIMEOUT)
             self.did_add_to_cart += 1
         except Exception:
-            return
+            return False
         await think(500, 1200)
+        return True
 
     async def _pdp_view_media(self):
         selectors = [
@@ -1681,6 +1710,88 @@ class Session:
                 ], key="weight") or {}
                 stage = picked.get("stage", "payment")
             await checkout_engine.abandon_checkout(self.page, stage, debug=self.debug)
+        self.stop_requested = True
+
+    async def _add_random_products(self, count: int) -> int:
+        """Add `count` DIFFERENT random products to the cart.
+
+        Re-enters a category listing before each product so every add is a
+        fresh navigation — that also clears the BigCommerce cart-preview
+        modal, which otherwise intercepts the next click.
+        """
+        added = 0
+        for i in range(max(1, count)):
+            if self.stop_requested:
+                break
+            with contextlib.suppress(Exception):
+                await self._open_random_category({})
+            if self.stop_requested:
+                break
+            if not await self._open_product_link():
+                debug_print(self.debug, f"[S{self.id}] bc: no product link for item {i + 1}")
+                continue
+            await self._maybe_scroll_page(prob=0.7, depth_min=0.15, depth_max=0.55,
+                                         steps_min=1, steps_max=4)
+            with contextlib.suppress(Exception):
+                await self._pdp_select_variant()
+            if await self._add_to_cart(force=True):
+                added += 1
+                debug_print(self.debug, f"[S{self.id}] bc: added product {added}/{count}")
+            else:
+                debug_print(self.debug, f"[S{self.id}] bc: add-to-cart failed for item {i + 1}")
+            await think(self.think_cfg["page_min_ms"], self.think_cfg["page_max_ms"])
+        return added
+
+    async def _broken_checkout(self, step: Optional[dict] = None):
+        """Broken-checkout scenario: cart N products, pay by bank/COD, fail, retry.
+
+        Retries are the FAILED submissions after the first one:
+        BROKEN_CHECKOUT_RETRY_MIN..MAX (default 1-7), so total Place Order
+        submissions = retries + 1. The session ends after the last attempt
+        whether or not the order ever went through.
+        """
+        step = step or {}
+        want = int(step.get("products", self.bc_products))
+        added = await self._add_random_products(want)
+        if added <= 0:
+            debug_print(self.debug, f"[S{self.id}] bc: nothing added to cart; ending")
+            self.stop_requested = True
+            return
+
+        await self._view_cart()
+        await self._maybe_scroll_page(prob=0.6, depth_min=0.1, depth_max=0.45,
+                                     steps_min=1, steps_max=3)
+
+        if not await checkout_engine.proceed_to_checkout(self.page, debug=self.debug):
+            debug_print(self.debug, f"[S{self.id}] bc: could not reach checkout; ending")
+            self.stop_requested = True
+            return
+        self.did_start_checkout += 1
+
+        method = random.choice(self.bc_methods)
+        retries = random.randint(self.bc_retry_min, self.bc_retry_max)
+        debug_print(
+            self.debug,
+            f"[S{self.id}] bc: {added} item(s) in cart, paying via '{method}', "
+            f"{retries} retry/retries planned ({retries + 1} submissions max)",
+        )
+        summary = await checkout_engine.complete_checkout_offline(
+            self.page,
+            checkout_engine.random_identity(),
+            method,
+            max_attempts=retries + 1,
+            wait_min=self.bc_wait_min,
+            wait_max=self.bc_wait_max,
+            debug=self.debug,
+        )
+        if summary.get("success"):
+            self.did_complete_checkout += 1
+        debug_print(
+            self.debug,
+            f"[S{self.id}] bc result: method={summary.get('label') or method} "
+            f"attempts={summary.get('attempts')} success={summary.get('success')} "
+            f"last_error={(summary.get('errors') or ['-'])[-1]}",
+        )
         self.stop_requested = True
 
     async def _start_checkout(self):

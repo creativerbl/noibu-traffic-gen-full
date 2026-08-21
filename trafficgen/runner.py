@@ -302,8 +302,13 @@ class Runner:
         )
 
     async def _schedule_loop(self, browser, pw, device_pool):
-        interval = max(60.0 / max(self.cfg.sessions_per_minute, 0.1), 0.25)
-        debug_print(self.cfg.debug, f"Start interval ≈ {interval:.2f}s for {self.cfg.sessions_per_minute} sessions/min")
+        # NOTE: the floor here used to be 0.1/min, which silently clamped any
+        # slower rate (e.g. 1 session/hour = 0.01667/min) to a 10-minute
+        # interval. Keep it effectively unbounded so hourly rates work.
+        interval = max(60.0 / max(self.cfg.sessions_per_minute, 1e-6), 0.25)
+        jitter = min(max(self._parse_float_env("SCHEDULER_JITTER", default=0.15, minimum=0.0), 0.0), 0.9)
+        start_now = os.getenv("SCHEDULER_START_IMMEDIATELY", "0") == "1"
+        debug_print(self.cfg.debug, f"Start interval ≈ {interval:.2f}s (jitter ±{jitter:.0%}) for {self.cfg.sessions_per_minute} sessions/min")
         started_total = 0
         while not self.stop_event.is_set():
             if self.restart_event.is_set():
@@ -321,7 +326,11 @@ class Runner:
             if self._scheduler_circuit_active():
                 await asyncio.sleep(min(interval, 1.0))
                 continue
-            await asyncio.sleep(interval * random.uniform(0.85, 1.15))
+            if start_now and started_total == 0:
+                debug_print(self.cfg.debug, "SCHEDULER_START_IMMEDIATELY=1: first session now")
+                await asyncio.sleep(random.uniform(1.0, 3.0))
+            else:
+                await asyncio.sleep(interval * random.uniform(1.0 - jitter, 1.0 + jitter))
             if self.stop_event.is_set() or self.restart_event.is_set():
                 break
             await self.sem.acquire()

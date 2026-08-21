@@ -36,8 +36,23 @@ def _normalize_to_100(weights):
     return floored
 
 def _load_flows_from_disk() -> list:
+    """Load flow YAMLs. FLOWS_ONLY=a,b restricts loading to those file stems.
+
+    Used by the broken-checkout branch (FLOWS_ONLY=broken-checkout) so the
+    scenario runs in isolation instead of competing with the other flows.
+    """
     flow_dir = Path(__file__).parent / "trafficgen" / "flows"
     flow_files = sorted(flow_dir.glob("*.yaml"))
+    only = [x.strip() for x in (os.getenv("FLOWS_ONLY", "") or "").split(",") if x.strip()]
+    if only:
+        wanted = {o[:-5] if o.endswith(".yaml") else o for o in only}
+        flow_files = [p for p in flow_files if p.stem in wanted]
+        if not flow_files:
+            raise SystemExit(
+                f"FLOWS_ONLY={','.join(only)} matched no files in {flow_dir}. "
+                f"Available: {', '.join(sorted(p.stem for p in flow_dir.glob('*.yaml')))}"
+            )
+        print(f"FLOWS_ONLY active: {', '.join(p.stem for p in flow_files)}", flush=True)
     flows = load_yaml_files([str(p) for p in flow_files])
     return [f for f in flows if f]
 
@@ -104,13 +119,13 @@ def main():
         allowlist_roots=[origin],
         sessions_per_minute=sessions_per_min,
         avg_session_minutes=avg_session_min,
-        max_concurrency=int(sessions_per_min*avg_session_min)+10,
-        global_qps_cap=6.0,
+        max_concurrency=int(os.getenv("MAX_CONCURRENCY", str(int(sessions_per_min*avg_session_min)+10))),
+        global_qps_cap=float(os.getenv("GLOBAL_QPS_CAP", "6.0")),
         allow_checkout=True,
         checkout_complete_rate=checkout_rate,
         device_mix=build_device_mix_from_env(),
-        locales=["en-US","en-CA","en-GB","fr-CA"],
-        timezones=["America/Toronto","America/New_York","America/Vancouver","Europe/London"],
+        locales=[x for x in _parse_csv(os.getenv("LOCALES", "en-US,en-CA,en-GB,fr-CA")) if x],
+        timezones=[x for x in _parse_csv(os.getenv("TIMEZONES", "America/Toronto,America/New_York,America/Vancouver,Europe/London")) if x],
         flows=flows,
         think_times={"page_min_ms":800,"page_max_ms":2200,"scroll_min_ms":200,"scroll_max_ms":700},
         smoke=False,

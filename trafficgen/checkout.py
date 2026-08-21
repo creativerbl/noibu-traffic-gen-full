@@ -22,8 +22,10 @@ Public API:
 """
 
 import asyncio
+import contextlib
 import os
 import random
+import re
 import time
 from typing import Optional
 from urllib.parse import urlparse
@@ -660,3 +662,325 @@ async def abandon_checkout(page, stage: str, debug: bool = False):
     # Hesitate like a real abandoner, then just walk away.
     await _human_delay(2, 6)
     _log(f"Checkout: abandoned at {stage} stage")
+
+
+# ── offline payment methods (bank deposit / cash on delivery) ────────────────
+#
+# BigCommerce "offline" payment methods (Bank Deposit, Cash on Delivery,
+# Check, Money Order) render as a radio in the payment step with NO card
+# iframes — you select the radio and submit. The broken-checkout scenario
+# uses these because the failure surfaces on order submission rather than
+# in a hosted card field, which is what we want Noibu to capture.
+
+OFFLINE_METHOD_PATTERNS = {
+    # key -> (human label, [regex patterns matched against the option text])
+    "bank": ("Bank Deposit", [
+        r"bank\s*deposit",
+        r"bank\s*transfer",
+        r"pay\s*by\s*bank",
+        r"\bbank\b",
+        r"wire\s*transfer",
+    ]),
+    "cod": ("Cash on Delivery", [
+        r"cash\s*on\s*delivery",
+        r"\bc\.?o\.?d\.?\b",
+        r"cash\s*on\s*deliv",
+        r"pay\s*on\s*delivery",
+        r"\bcash\b",
+    ]),
+}
+
+# Alias table so env values like "bank_deposit" or "cash-on-delivery" work.
+OFFLINE_METHOD_ALIASES = {
+    "bank": "bank", "bankdeposit": "bank", "bank_deposit": "bank",
+    "bank-deposit": "bank", "banktransfer": "bank", "wire": "bank",
+    "cod": "cod", "cash": "cod", "cashondelivery": "cod",
+    "cash_on_delivery": "cod", "cash-on-delivery": "cod",
+}
+
+PAYMENT_STEP_RADIO_SELECTOR = (
+    'input[name="paymentProviderRadio"], '
+    '.checkout-step--payment input[type="radio"], '
+    '[data-test="checkout-payment-methods"] input[type="radio"], '
+    '.form-checklist input[type="radio"]'
+)
+
+ORDER_ERROR_SELECTORS = [
+    '.alertBox--error',
+    '.alertBox.alertBox--error',
+    '[data-test="alert-error"]',
+    '[data-test="checkout-error"]',
+    '.form-inlineMessage--error',
+    '.optimizedCheckout-form-input--error',
+    '[role="alert"]',
+]
+
+
+def normalize_offline_method(name: str) -> str:
+    """Map a loose env value to a canonical offline-method key ('bank'/'cod')."""
+    key = re.sub(r"[^a-z]", "", (name or "").lower())
+    if key in OFFLINE_METHOD_ALIASES:
+        return OFFLINE_METHOD_ALIASES[key]
+    # try the underscore/hyphen-preserving form too
+    raw = (name or "").strip().lower()
+    return OFFLINE_METHOD_ALIASES.get(raw, "bank")
+
+
+def offline_method_matches(method_key: str, option_text: str) -> bool:
+    """True when a payment option's visible text looks like `method_key`."""
+    _label, patterns = OFFLINE_METHOD_PATTERNS.get(
+        method_key, OFFLINE_METHOD_PATTERNS["bank"]
+    )
+    text = " ".join((option_text or "").lower().split())
+    if not text:
+        return False
+    # Never let the generic /bank/ pattern swallow a COD option (or vice versa).
+    other = "cod" if method_key == "bank" else "bank"
+    _ol, other_patterns = OFFLINE_METHOD_PATTERNS[other]
+    specific_other = [p for p in other_patterns if len(p) > 8]
+    if any(re.search(p, text) for p in specific_other):
+        return False
+    return any(re.search(p, text) for p in patterns)
+
+
+async def _payment_options(page, debug: bool = False):
+    """Enumerate the payment step's radios as [(visible_text, locator), ...]."""
+    out = []
+    radios = page.locator(PAYMENT_STEP_RADIO_SELECTOR)
+    try:
+        n = await radios.count()
+    except Exception:
+        n = 0
+    for i in range(n):
+        radio = radios.nth(i)
+        try:
+            text = await radio.evaluate(
+                """el => {
+                    const item = el.closest('.form-checklist-item')
+                        || el.closest('li')
+                        || el.closest('label')
+                        || el.parentElement;
+                    const t = item ? (item.innerText || item.textContent || '') : '';
+                    return (t || el.getAttribute('aria-label') || el.value || '');
+                }"""
+            )
+        except Exception:
+            text = ""
+        text = " ".join((text or "").split())
+        out.append((text, radio))
+        _dbg(debug, f"  payment option[{i}]: {text!r}")
+    return out
+
+
+async def select_offline_payment(page, method: str, debug: bool = False) -> Optional[str]:
+    """Select the Bank Deposit / Cash on Delivery radio in the payment step.
+
+    Returns the matched option's visible text, or None if no option matched.
+    BigCommerce visually hides the radio itself, so we click its <label> and
+    only fall back to check(force=True) when no label is reachable.
+    """
+    key = normalize_offline_method(method)
+    # Give the payment step a moment to render after the shipping continue.
+    for sel in (
+        '.checkout-step--payment',
+        '[data-test="checkout-payment-methods"]',
+        '#checkout-payment-continue',
+    ):
+        try:
+            if await page.locator(sel).first.is_visible(timeout=8_000):
+                break
+        except Exception:
+            continue
+
+    options = await _payment_options(page, debug=debug)
+    if not options:
+        _log(f"Checkout WARNING: no payment options found (wanted {key})")
+        return None
+
+    for text, radio in options:
+        if not offline_method_matches(key, text):
+            continue
+        rid = None
+        with contextlib.suppress(Exception):
+            rid = await radio.get_attribute("id")
+        clicked = False
+        if rid:
+            label = page.locator(f'label[for="{rid}"]').first
+            try:
+                if await label.is_visible(timeout=2_000):
+                    await label.click()
+                    clicked = True
+            except Exception:
+                clicked = False
+        if not clicked:
+            try:
+                await radio.check(force=True, timeout=5_000)
+                clicked = True
+            except Exception:
+                clicked = False
+        if clicked:
+            await _human_delay(1.5, 3.0)  # offline methods render an instruction blurb
+            _log(f"Checkout: payment method selected - {text or key}")
+            return text or key
+        _dbg(debug, f"  matched {text!r} but could not select it")
+
+    available = ", ".join(t for t, _ in options if t) or "(unlabelled)"
+    _log(f"Checkout WARNING: no '{key}' payment option; available: {available}")
+    return None
+
+
+async def _read_order_error(page, debug: bool = False) -> Optional[str]:
+    """Return the visible checkout error text, if any."""
+    for sel in ORDER_ERROR_SELECTORS:
+        loc = page.locator(sel)
+        try:
+            n = await loc.count()
+        except Exception:
+            continue
+        for i in range(min(n, 4)):
+            el = loc.nth(i)
+            try:
+                if not await el.is_visible(timeout=800):
+                    continue
+                text = " ".join(((await el.inner_text()) or "").split())
+            except Exception:
+                continue
+            if text:
+                _dbg(debug, f"  order error via {sel}: {text[:200]}")
+                return text[:500]
+    return None
+
+
+async def place_order_attempt(page, debug: bool = False) -> dict:
+    """Click Place Order ONCE and report what happened.
+
+    Returns {"clicked": bool, "success": bool, "error": str|None}. Does not
+    retry — the caller owns the retry loop (see complete_checkout_offline).
+    """
+    result = {"clicked": False, "success": False, "error": None}
+
+    for sel in PLACE_ORDER_SELECTORS:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=3_000):
+                await _human_delay(0.5, 1.5)
+                await btn.click()
+                result["clicked"] = True
+                _dbg(debug, f"Clicked place order via: {sel}")
+                break
+        except Exception:
+            continue
+
+    if not result["clicked"]:
+        result["error"] = "place-order button not found"
+        _log("Checkout WARNING: Could not find Place Order button")
+        return result
+
+    # Let the submission resolve (success redirect or error banner).
+    await _human_delay(4, 7)
+    if "order-confirmation" in (page.url or ""):
+        result["success"] = True
+        return result
+    # Fail FAST when the checkout already rendered an error — no point burning
+    # a 12s confirmation wait on every one of up to 8 attempts.
+    err = await _read_order_error(page, debug=debug)
+    if err:
+        result["error"] = err
+        return result
+    try:
+        await page.wait_for_url("**/order-confirmation**", timeout=12_000)
+        result["success"] = True
+        return result
+    except PwTimeout:
+        pass
+
+    result["error"] = await _read_order_error(page, debug=debug) or "no confirmation page"
+    return result
+
+
+PLACE_ORDER_SELECTORS = [
+    '#checkout-payment-continue',
+    'button[data-test="place-order-button"]',
+    'button:has-text("Place Order")',
+    'input[value="Place Order"]',
+    'button:has-text("Complete Order")',
+    'button:has-text("Submit Order")',
+    '.checkout-step--payment button[type="submit"]',
+]
+
+
+async def complete_checkout_offline(
+    page,
+    identity: dict,
+    method: str,
+    *,
+    max_attempts: int = 2,
+    wait_min: float = 5.0,
+    wait_max: float = 20.0,
+    debug: bool = False,
+) -> dict:
+    """Checkout with an offline payment method, retrying a failed submission.
+
+    email → shipping → select bank/COD → Place Order. On failure, wait
+    wait_min..wait_max seconds and click Place Order again, up to
+    `max_attempts` total submissions. Between attempts the shopper scrolls
+    back to the error and the button, so the retries look like a frustrated
+    human rather than a loop.
+
+    Returns a summary dict: {method, label, attempts, success, errors}.
+    """
+    summary = {
+        "method": normalize_offline_method(method),
+        "label": None,
+        "attempts": 0,
+        "success": False,
+        "errors": [],
+    }
+    try:
+        await _stage_customer(page, identity, debug=debug)
+        await _stage_shipping(page, identity, debug=debug)
+        summary["label"] = await select_offline_payment(
+            page, summary["method"], debug=debug
+        )
+    except PwTimeout as e:
+        _log(f"Checkout TIMEOUT before submission: {e}")
+        summary["errors"].append(f"timeout before submission: {e}")
+        return summary
+    except Exception as e:
+        _log(f"Checkout ERROR before submission: {e}")
+        summary["errors"].append(f"error before submission: {e}")
+        return summary
+
+    attempts = max(1, int(max_attempts))
+    for attempt in range(1, attempts + 1):
+        summary["attempts"] = attempt
+        try:
+            res = await place_order_attempt(page, debug=debug)
+        except Exception as e:
+            res = {"clicked": False, "success": False, "error": f"exception: {e}"}
+        if res.get("success"):
+            summary["success"] = True
+            _log(f"Checkout: ORDER PLACED on attempt {attempt}/{attempts}")
+            await _human_delay(5, 10)  # linger so Noibu records the confirmation
+            return summary
+        err = res.get("error") or "unknown failure"
+        summary["errors"].append(err)
+        _log(f"Checkout: order FAILED (attempt {attempt}/{attempts}) - {err}")
+        if attempt >= attempts:
+            break
+        wait_s = random.uniform(min(wait_min, wait_max), max(wait_min, wait_max))
+        _log(f"Checkout: waiting {wait_s:.1f}s before retry {attempt + 1}/{attempts}")
+        await asyncio.sleep(wait_s)
+        # Re-read the error, then scroll back down to the button like a human.
+        with contextlib.suppress(Exception):
+            await page.mouse.wheel(0, random.randint(-500, -180))
+            await asyncio.sleep(random.uniform(0.6, 1.8))
+            await page.mouse.wheel(0, random.randint(200, 600))
+            await asyncio.sleep(random.uniform(0.4, 1.2))
+
+    _log(
+        f"Checkout: gave up after {summary['attempts']} attempt(s) "
+        f"on {summary['label'] or summary['method']}"
+    )
+    await _human_delay(3, 8)  # dwell on the failed checkout before leaving
+    return summary

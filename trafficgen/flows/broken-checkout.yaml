@@ -1,0 +1,15 @@
+# Broken-checkout scenario (branch: broken-checkout)
+#
+# One session per hour that builds a 3-item cart, enters checkout, pays with
+# an OFFLINE method (bank deposit or cash on delivery), fails to place the
+# order, retries 1-7 times with a 5-20s pause between attempts, then leaves.
+#
+# skip_nav_walk keeps the whole session budget for the cart + retry loop
+# instead of spending it on the header walk.
+type: scripted
+name: "broken-checkout"
+weight: 100
+skip_nav_walk: true
+steps:
+  - action: broken_checkout
+    products: 3
