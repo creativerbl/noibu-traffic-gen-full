@@ -45,7 +45,9 @@ def pick_device(pool, playwright):
     else:
         if chosen.name == "desktop-chrome":
             context_args.update({
-                "viewport": {"width": 1366, "height": 864},
+                # Full HD (1920x1080) desktop.
+                "viewport": {"width": 1920, "height": 1080},
+                "screen": {"width": 1920, "height": 1080},
                 "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                               "(KHTML, like Gecko) Chrome/122 Safari/537.36",
                 "is_mobile": False,
