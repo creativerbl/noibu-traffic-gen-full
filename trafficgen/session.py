@@ -1849,6 +1849,7 @@ class Session:
         try:
             btn = self.page.locator(self.AB_ADD_TO_CART_SEL)
             await btn.wait_for(state="visible", timeout=10_000)
+            await self._ab_pick_required_options()
             await think(600, 1500)
             async with self.page.expect_response(
                 lambda r: "/remote/v1/cart/add" in r.url and r.request.method == "POST",
@@ -1857,10 +1858,57 @@ class Session:
                 await btn.click()
             await think(1200, 2200)
             self.did_add_to_cart += 1
+            await self._ab_close_added_modal()
             return True
         except Exception as e:
             await self._ab_log_page(f"add-to-cart failed ({type(e).__name__})")
             return False
+
+    async def _ab_pick_required_options(self):
+        """Products with required options (e.g. size/colour swatches) won't
+        add until one is chosen: click the first choice of every required
+        radio group and pick the first real option of every required select."""
+        form = "form[data-cart-item-add]"
+        names = await self.page.eval_on_selector_all(
+            f"{form} input[type=radio][required]",
+            "els => [...new Set(els.map(e => e.name))]",
+        )
+        for name in names:
+            radio = self.page.locator(f'{form} input[type=radio][name="{name}"]').first
+            rid = await radio.get_attribute("id")
+            label = self.page.locator(f'label[for="{rid}"]') if rid else None
+            with contextlib.suppress(Exception):
+                if label is not None and await label.count():
+                    await label.first.click(timeout=5_000)
+                else:
+                    await radio.check(timeout=5_000, force=True)
+                await think(300, 700)
+        selects = self.page.locator(f"{form} select[required]")
+        for i in range(await selects.count()):
+            sel = selects.nth(i)
+            with contextlib.suppress(Exception):
+                values = await sel.eval_on_selector_all(
+                    "option", "os => os.map(o => o.value).filter(v => v)"
+                )
+                if values:
+                    await sel.select_option(values[0], timeout=5_000)
+                    await think(300, 700)
+        if names:
+            # let the theme re-price / re-enable the button for the variant
+            await think(800, 1500)
+
+    async def _ab_close_added_modal(self):
+        """After an add, BigCommerce opens the "added to cart" modal whose
+        backdrop covers the header CART link. Close it."""
+        modal = self.page.locator("#previewModal.open")
+        try:
+            await modal.wait_for(state="visible", timeout=5_000)
+        except Exception:
+            return
+        with contextlib.suppress(Exception):
+            await self.page.locator("#previewModal .modal-close").first.click(timeout=5_000)
+        with contextlib.suppress(Exception):
+            await self.page.locator(".modal-background").wait_for(state="hidden", timeout=5_000)
 
     async def _open_cart_via_preview(self) -> bool:
         """Header CART -> preview dropdown -> "View Cart" -> /cart.php."""
