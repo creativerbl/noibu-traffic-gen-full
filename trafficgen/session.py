@@ -22,6 +22,70 @@ from trafficgen import checkout as checkout_engine
 ALLOW_NAV_TIMEOUT = 25000
 SEL_TIMEOUT = 15000
 
+
+class _ABTally:
+    """Process-wide A/B outcome counter for the ab-test scenario.
+
+    Prints an [AB SUMMARY] line every AB_SUMMARY_EVERY finished sessions
+    (default 5), or when AB_SUMMARY_MINUTES (default 30) have passed since the
+    last summary, and once more when the process exits.
+    """
+    OUTCOMES = (
+        ("control", "control"),
+        ("sticky_ordered", "sticky: order placed"),
+        ("sticky_order_failed", "sticky: order NOT confirmed"),
+        ("sticky_no_checkout", "sticky: checkout didn't load"),
+        ("no_cart", "never reached cart"),
+        ("no_items", "nothing added"),
+    )
+
+    def __init__(self):
+        import time as _t
+        self._time = _t
+        self.started = 0
+        self.counts = {k: 0 for k, _ in self.OUTCOMES}
+        self.t0 = _t.time()
+        self.last_print = self.t0
+        self.every = max(1, int(os.getenv("AB_SUMMARY_EVERY", "5")))
+        self.minutes = max(1.0, float(os.getenv("AB_SUMMARY_MINUTES", "30")))
+        import atexit
+        atexit.register(lambda: self.started and self.print_summary("final"))
+
+    def start(self):
+        self.started += 1
+
+    def record(self, outcome: str):
+        self.counts[outcome] = self.counts.get(outcome, 0) + 1
+        finished = sum(self.counts.values())
+        due_n = finished % self.every == 0
+        due_t = (self._time.time() - self.last_print) >= self.minutes * 60
+        if due_n or due_t:
+            self.print_summary()
+
+    def print_summary(self, tag: str = ""):
+        c = self.counts
+        finished = sum(c.values())
+        sticky = c["sticky_ordered"] + c["sticky_order_failed"] + c["sticky_no_checkout"]
+        decided = c["control"] + sticky  # sessions that actually saw a variant
+        pct = lambda n: f"{(100.0 * n / decided):.0f}%" if decided else "-"
+        mins = int((self._time.time() - self.t0) // 60)
+        since = self._time.strftime("%H:%M", self._time.localtime(self.t0))
+        lines = [
+            f"[AB SUMMARY{(' ' + tag) if tag else ''}] {self.started} started, "
+            f"{finished} finished since {since} ({mins // 60}h{mins % 60:02d}m)",
+            f"  variant split : control {c['control']} ({pct(c['control'])}) | "
+            f"sticky {sticky} ({pct(sticky)})",
+            f"  sticky detail : ordered {c['sticky_ordered']} | order not confirmed "
+            f"{c['sticky_order_failed']} | checkout didn't load {c['sticky_no_checkout']}",
+            f"  no variant    : never reached cart {c['no_cart']} | nothing added "
+            f"{c['no_items']} | unfinished/timed out {self.started - finished}",
+        ]
+        print("\n".join(lines), flush=True)
+        self.last_print = self._time.time()
+
+
+AB_TALLY = _ABTally()
+
 def _normalize_label(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
@@ -1934,10 +1998,12 @@ class Session:
         lo = int(step.get("products_min", self.ab_products_min))
         hi = max(lo, int(step.get("products_max", self.ab_products_max)))
         want = random.randint(lo, hi)
+        AB_TALLY.start()
 
         urls = await self._ab_product_urls()
         if not urls:
             debug_print(self.debug, f"[S{self.id}] ab: no products found; ending")
+            AB_TALLY.record("no_items")
             self.stop_requested = True
             return
         random.shuffle(urls)
@@ -1950,11 +2016,13 @@ class Session:
                 debug_print(self.debug, f"[S{self.id}] ab: added {added}/{want} ← {url}")
         if added == 0:
             debug_print(self.debug, f"[S{self.id}] ab: nothing added to cart; ending")
+            AB_TALLY.record("no_items")
             self.stop_requested = True
             return
 
         if not await self._open_cart_via_preview():
             debug_print(self.debug, f"[S{self.id}] ab: could not reach cart page; ending")
+            AB_TALLY.record("no_cart")
             self.stop_requested = True
             return
 
@@ -1969,6 +2037,7 @@ class Session:
                 f"[S{self.id}] ab result: variant=control items={added} "
                 f"primary_button={'yes' if primary else 'no'} -> exit",
             )
+            AB_TALLY.record("control")
             self.stop_requested = True
             return
 
@@ -1979,6 +2048,7 @@ class Session:
             await self.page.wait_for_url("**/checkout**", timeout=30_000)
         except Exception:
             await self._ab_log_page("did not reach checkout after sticky click")
+            AB_TALLY.record("sticky_no_checkout")
             self.stop_requested = True
             return
         self.did_start_checkout += 1
@@ -1989,6 +2059,7 @@ class Session:
         if ok:
             self.did_complete_checkout += 1
         debug_print(self.debug, f"[S{self.id}] ab result: variant=sticky items={added} order_placed={ok}")
+        AB_TALLY.record("sticky_ordered" if ok else "sticky_order_failed")
         self.stop_requested = True
 
     async def _start_checkout(self):
