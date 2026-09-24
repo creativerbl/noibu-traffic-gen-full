@@ -173,3 +173,34 @@ the retry count is a ceiling, not a fixed number of clicks.
 **Note:** `SESSIONS_PER_MINUTE` below `0.1` used to be silently clamped by the
 scheduler to a 10-minute interval. That floor is fixed on this branch, so
 sub-hourly rates now mean what they say.
+
+---
+
+## Branch: `ab-test`
+
+Cut from `broken-checkout`. Runs **one scenario only**, **5 sessions per hour**
+(~every 12 min, ±15% jitter, one at a time) to drive traffic into the cart-page
+checkout A/B test.
+
+**What one session does**
+
+1. Lands on the store (legacy referrer/UTM attribution — personas are off).
+2. Adds a **random 1–3 products** to the cart, re-entering a category listing
+   before each one.
+3. Clicks **CART** in the header, then **View Cart** in the preview dropdown
+   (falls back to `/cart.php` if the preview doesn't open, e.g. on mobile).
+4. On the cart page:
+   - **Sticky banner visible** (`a.cart-stickyCheckout-button[data-sticky-checkout-now-action]`)
+     → clicks it and completes checkout with the test card from `.env`
+     (`CARD_NUMBER`, `CARD_EXPIRY`, `CARD_CVV`).
+   - **Only the primary button** (`a[data-primary-checkout-now-action]`)
+     → ends the session.
+
+Each session logs one result line, e.g.
+`ab result: variant=sticky items=2 order_placed=True` or
+`ab result: variant=control items=3 primary_button=yes -> exit`.
+
+**Knobs (`.env`)**: `SESSIONS_PER_MINUTE=0.0833333`, `FLOWS_ONLY=ab-test`,
+`AB_TEST_PRODUCTS_MIN/MAX`, `AB_TEST_STICKY_WAIT_MS`, `SESSION_MAX_SECONDS=600`.
+
+Run it the same way: `./run_with_venv.sh`.

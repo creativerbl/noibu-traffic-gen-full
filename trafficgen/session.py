@@ -265,6 +265,17 @@ class Session:
         self.bc_wait_min = float(os.getenv("BROKEN_CHECKOUT_RETRY_WAIT_MIN_S", "5"))
         self.bc_wait_max = float(os.getenv("BROKEN_CHECKOUT_RETRY_WAIT_MAX_S", "20"))
 
+        # ── A/B-test scenario (see trafficgen/flows/ab-test.yaml)
+        # Cart 1..N random products, open the cart via the header preview,
+        # then branch on which checkout button the cart page renders:
+        # sticky banner (variant) -> complete the order with the test card;
+        # primary button only (control) -> end the session.
+        self.ab_products_min = max(1, int(os.getenv("AB_TEST_PRODUCTS_MIN", "1")))
+        self.ab_products_max = max(
+            self.ab_products_min, int(os.getenv("AB_TEST_PRODUCTS_MAX", "3"))
+        )
+        self.ab_sticky_wait_ms = int(os.getenv("AB_TEST_STICKY_WAIT_MS", "6000"))
+
         # Search
         self.search_terms = _parse_list_csv(os.getenv(
             "SEARCH_TERMS",
@@ -642,6 +653,8 @@ class Session:
             await self._checkout_start()
         elif kind == "broken_checkout":
             await self._broken_checkout(step)
+        elif kind == "ab_test_checkout":
+            await self._ab_test_checkout(step)
         elif kind == "content_browse":
             await self._content_browse(step)
         elif kind == "content_page":
@@ -1791,6 +1804,140 @@ class Session:
             f"[S{self.id}] bc result: method={summary.get('label') or method} "
             f"attempts={summary.get('attempts')} success={summary.get('success')} "
             f"last_error={(summary.get('errors') or ['-'])[-1]}",
+        )
+        self.stop_requested = True
+
+    # ── A/B-test scenario ────────────────────────────────────────────────
+    AB_STICKY_SEL = (
+        "a.cart-stickyCheckout-button[data-sticky-checkout-now-action], "
+        "a[data-sticky-checkout-now-action]"
+    )
+    AB_PRIMARY_SEL = "a[data-primary-checkout-now-action]"
+
+    async def _open_cart_via_preview(self) -> bool:
+        """Header CART -> preview dropdown -> "View Cart" -> cart page.
+
+        Falls back to a direct /cart.php navigation when the preview doesn't
+        open (e.g. mobile layouts that link the cart icon straight through).
+        Returns True when we end up on the cart page.
+        """
+        clicked_cart = False
+        for sel in (
+            "a.navUser-action--cart",
+            "a[data-cart-preview]",
+            ".navUser-item--cart a",
+            "a.navUser-action[href*='cart.php']",
+        ):
+            try:
+                loc = self.page.locator(sel).first
+                if await loc.is_visible(timeout=1500):
+                    await loc.click(timeout=SEL_TIMEOUT)
+                    clicked_cart = True
+                    debug_print(self.debug, f"[S{self.id}] ab: clicked header cart ({sel})")
+                    break
+            except Exception:
+                continue
+        if not clicked_cart:
+            with contextlib.suppress(Exception):
+                await self.page.get_by_role("link", name=re.compile(r"^\s*cart", re.I)).first.click(
+                    timeout=SEL_TIMEOUT
+                )
+                clicked_cart = True
+        await think(700, 1600)
+
+        if "cart.php" not in self.page.url:
+            try:
+                view = self.page.locator(
+                    "#cart-preview-dropdown a:has-text('View Cart'), "
+                    ".previewCart a:has-text('View Cart'), "
+                    "a:has-text('View Cart'):visible"
+                ).first
+                await view.wait_for(state="visible", timeout=6000)
+                await think(400, 1100)
+                await view.click(timeout=SEL_TIMEOUT)
+                with contextlib.suppress(Exception):
+                    await self.page.wait_for_load_state("load", timeout=ALLOW_NAV_TIMEOUT)
+                debug_print(self.debug, f"[S{self.id}] ab: clicked View Cart")
+            except Exception:
+                debug_print(self.debug, f"[S{self.id}] ab: preview/View Cart not found; goto /cart.php")
+                with contextlib.suppress(Exception):
+                    await self._guarded_goto(f"{self.origin}/cart.php")
+        return "cart.php" in self.page.url
+
+    async def _ab_test_checkout(self, step: Optional[dict] = None):
+        """A/B-test scenario.
+
+        1. Add a random 1..AB_TEST_PRODUCTS_MAX products (default 1-3).
+        2. Header CART -> View Cart.
+        3. Sticky "Check out" banner visible  -> click it, complete checkout
+           with the test card (CARD_NUMBER/CARD_EXPIRY/CARD_CVV).
+           Only the primary "Check out" button -> end the session.
+        """
+        step = step or {}
+        lo = int(step.get("products_min", self.ab_products_min))
+        hi = max(lo, int(step.get("products_max", self.ab_products_max)))
+        want = random.randint(lo, hi)
+        added = await self._add_random_products(want)
+        if added <= 0:
+            debug_print(self.debug, f"[S{self.id}] ab: nothing added to cart; ending")
+            self.stop_requested = True
+            return
+
+        if not await self._open_cart_via_preview():
+            debug_print(self.debug, f"[S{self.id}] ab: could not reach cart page; ending")
+            self.stop_requested = True
+            return
+
+        # Sticky banners often reveal on scroll, so nudge the page before
+        # deciding which variant we're in.
+        await self._maybe_scroll_page(prob=1.0, depth_min=0.15, depth_max=0.45,
+                                     steps_min=1, steps_max=3)
+        sticky = self.page.locator(self.AB_STICKY_SEL).first
+        sticky_visible = False
+        try:
+            await sticky.wait_for(state="visible", timeout=self.ab_sticky_wait_ms)
+            sticky_visible = True
+        except Exception:
+            sticky_visible = False
+
+        if not sticky_visible:
+            primary_visible = False
+            with contextlib.suppress(Exception):
+                primary_visible = await self.page.locator(self.AB_PRIMARY_SEL).first.is_visible()
+            debug_print(
+                self.debug,
+                f"[S{self.id}] ab result: variant=control items={added} "
+                f"primary_button={'yes' if primary_visible else 'no'} -> exit",
+            )
+            self.stop_requested = True
+            return
+
+        debug_print(self.debug, f"[S{self.id}] ab: sticky checkout banner visible -> checkout")
+        await think(500, 1400)
+        try:
+            await sticky.click(timeout=SEL_TIMEOUT)
+        except Exception as e:
+            debug_print(self.debug, f"[S{self.id}] ab: sticky click failed ({e}); ending")
+            self.stop_requested = True
+            return
+        with contextlib.suppress(Exception):
+            await self.page.wait_for_load_state("networkidle", timeout=30_000)
+        await think(1500, 3000)
+        if "/checkout" not in self.page.url:
+            debug_print(self.debug, f"[S{self.id}] ab: not on checkout after sticky click (url={self.page.url}); ending")
+            self.stop_requested = True
+            return
+        self.did_start_checkout += 1
+
+        card = checkout_engine.default_card()
+        ok = await checkout_engine.complete_checkout(
+            self.page, checkout_engine.random_identity(), card, debug=self.debug
+        )
+        if ok:
+            self.did_complete_checkout += 1
+        debug_print(
+            self.debug,
+            f"[S{self.id}] ab result: variant=sticky items={added} order_placed={ok}",
         )
         self.stop_requested = True
 
