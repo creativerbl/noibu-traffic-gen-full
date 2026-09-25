@@ -312,7 +312,16 @@ class Runner:
         interval = max(60.0 / max(self.cfg.sessions_per_minute, 1e-6), 0.25)
         jitter = min(max(self._parse_float_env("SCHEDULER_JITTER", default=0.15, minimum=0.0), 0.0), 0.9)
         start_now = os.getenv("SCHEDULER_START_IMMEDIATELY", "0") == "1"
-        debug_print(self.cfg.debug, f"Start interval ≈ {interval:.2f}s (jitter ±{jitter:.0%}) for {self.cfg.sessions_per_minute} sessions/min")
+        # BACK_TO_BACK=1: ignore SESSIONS_PER_MINUTE. Start the next session as
+        # soon as a slot frees up (with MAX_CONCURRENCY=1: when the previous
+        # session ends), after a short BACK_TO_BACK_GAP_S pause.
+        back_to_back = os.getenv("BACK_TO_BACK", "0") == "1"
+        gap_lo = self._parse_float_env("BACK_TO_BACK_GAP_MIN_S", default=2.0, minimum=0.0)
+        gap_hi = max(gap_lo, self._parse_float_env("BACK_TO_BACK_GAP_MAX_S", default=5.0, minimum=0.0))
+        if back_to_back:
+            debug_print(self.cfg.debug, f"BACK_TO_BACK=1: next session starts {gap_lo:.0f}-{gap_hi:.0f}s after a slot frees (max {self.cfg.max_concurrency} at once)")
+        else:
+            debug_print(self.cfg.debug, f"Start interval ≈ {interval:.2f}s (jitter ±{jitter:.0%}) for {self.cfg.sessions_per_minute} sessions/min")
         started_total = 0
         while not self.stop_event.is_set():
             if self.restart_event.is_set():
@@ -330,14 +339,21 @@ class Runner:
             if self._scheduler_circuit_active():
                 await asyncio.sleep(min(interval, 1.0))
                 continue
-            if start_now and started_total == 0:
-                debug_print(self.cfg.debug, "SCHEDULER_START_IMMEDIATELY=1: first session now")
-                await asyncio.sleep(random.uniform(1.0, 3.0))
+            if back_to_back:
+                await self.sem.acquire()  # blocks until the previous session ends
+                if self.stop_event.is_set() or self.restart_event.is_set():
+                    self.sem.release()
+                    break
+                await asyncio.sleep(random.uniform(gap_lo, gap_hi) if started_total else random.uniform(1.0, 3.0))
             else:
-                await asyncio.sleep(interval * random.uniform(1.0 - jitter, 1.0 + jitter))
-            if self.stop_event.is_set() or self.restart_event.is_set():
-                break
-            await self.sem.acquire()
+                if start_now and started_total == 0:
+                    debug_print(self.cfg.debug, "SCHEDULER_START_IMMEDIATELY=1: first session now")
+                    await asyncio.sleep(random.uniform(1.0, 3.0))
+                else:
+                    await asyncio.sleep(interval * random.uniform(1.0 - jitter, 1.0 + jitter))
+                if self.stop_event.is_set() or self.restart_event.is_set():
+                    break
+                await self.sem.acquire()
             self.session_counter += 1
             started_total += 1
             self.metrics["started"] += 1
