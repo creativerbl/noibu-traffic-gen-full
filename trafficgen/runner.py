@@ -185,15 +185,7 @@ class Runner:
         async with async_playwright() as pw:
             device_pool = build_device_pool(self.cfg.device_mix)
             while not self.stop_event.is_set():
-                browser = await pw.chromium.launch(
-                    headless=headless,
-                    args=[
-                        "--disable-cache",
-                        "--disable-application-cache",
-                        "--disk-cache-size=0",
-                        "--aggressive-cache-discard",
-                    ],
-                )
+                browser = await self._launch_browser(pw)
                 self._on_browser_launch()
                 try:
                     await self._schedule_loop(browser, pw, device_pool)
@@ -301,6 +293,18 @@ class Runner:
             f"browser_restarts={self.metrics['browser_restarts']}",
         )
 
+    async def _launch_browser(self, pw):
+        headless = os.getenv("HEADLESS", "1") != "0"
+        return await pw.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-cache",
+                "--disable-application-cache",
+                "--disk-cache-size=0",
+                "--aggressive-cache-discard",
+            ],
+        )
+
     async def _schedule_loop(self, browser, pw, device_pool):
         # NOTE: the floor here used to be 0.1/min, which silently clamped any
         # slower rate (e.g. 1 session/hour = 0.01667/min) to a 10-minute
@@ -361,7 +365,15 @@ class Runner:
         success = False
         timed_out = False
         record_metrics = True
+        # BROWSER_PER_SESSION=1: launch a brand-new Chromium process for this
+        # session and close it afterwards, instead of a new context in the
+        # shared browser. The scheduler loop is untouched, so cadence holds.
+        own_browser = None
         try:
+            if os.getenv("BROWSER_PER_SESSION", "0") == "1":
+                own_browser = await self._launch_browser(pw)
+                browser = own_browser
+                debug_print(self.cfg.debug, f"[S{sid}] fresh Chromium process for this session")
             dev = pick_device(device_pool, pw)
             _is_desktop = not bool(dev["context_args"].get("is_mobile", False))
             _session_timeout = self._session_timeout * (
@@ -407,6 +419,9 @@ class Runner:
         except Exception as e:
             debug_print(self.cfg.debug, f"[session {sid}] error: {e}")
         finally:
+            if own_browser is not None:
+                with contextlib.suppress(Exception):
+                    await own_browser.close()
             if record_metrics:
                 self._register_session_result(success, timed_out)
             self.sem.release()

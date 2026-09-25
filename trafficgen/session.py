@@ -2032,10 +2032,25 @@ class Session:
             await sticky.wait_for(state="visible", timeout=self.ab_sticky_wait_ms)
         except Exception:
             primary = await self.page.locator(self.AB_PRIMARY_SEL).first.is_visible()
+            # Why control? The theme asks window.NoibuFeatureFlag for flag
+            # "3393-desktop-cart-sticky-checkout-cta" and falls back to
+            # "original" if the SDK isn't there within 1s.
+            diag = {}
+            with contextlib.suppress(Exception):
+                diag = await self.page.evaluate("""() => {
+                    const ff = window.NoibuFeatureFlag;
+                    let v = 'no-sdk';
+                    try { if (ff) v = ff.getClient().getStringValue(
+                        '3393-desktop-cart-sticky-checkout-cta', 'original'); }
+                    catch (e) { v = 'error: ' + e; }
+                    return { sdk: !!ff, flag: v, vw: innerWidth };
+                }""")
             debug_print(
                 self.debug,
                 f"[S{self.id}] ab result: variant=control items={added} "
-                f"primary_button={'yes' if primary else 'no'} -> exit",
+                f"primary_button={'yes' if primary else 'no'} "
+                f"flag_sdk={'yes' if diag.get('sdk') else 'no'} flag={diag.get('flag')} "
+                f"vw={diag.get('vw')} -> exit",
             )
             AB_TALLY.record("control")
             self.stop_requested = True
