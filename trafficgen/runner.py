@@ -59,8 +59,10 @@ class RunnerConfig:
 class Runner:
     def __init__(self, cfg: RunnerConfig):
         self.cfg = cfg
-        self.stop_event = asyncio.Event()
-        self.sem = asyncio.Semaphore(cfg.max_concurrency)
+        # Created in run(): on Python 3.9, asyncio primitives made outside the
+        # running loop bind to a different loop and fail under asyncio.run().
+        self.stop_event: asyncio.Event = None
+        self.sem: asyncio.Semaphore = None
         self.session_counter = 0
         self.consecutive_errors = 0  # back-off so a broken setup can't spin
 
@@ -75,6 +77,8 @@ class Runner:
         )
 
     async def run(self):
+        self.stop_event = asyncio.Event()
+        self.sem = asyncio.Semaphore(self.cfg.max_concurrency)
         loop = asyncio.get_running_loop()
         for s in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(s, self._request_stop)
