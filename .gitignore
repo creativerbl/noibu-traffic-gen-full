@@ -1,6 +1,5 @@
 .venv/
 *.patch
-trafficgen/.DS_Store
-trafficgen/flows/.DS_Store
 .DS_Store
-/trafficgen/__pycache__/*
+__pycache__/
+*.bundle

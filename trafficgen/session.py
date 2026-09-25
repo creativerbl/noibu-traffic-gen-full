@@ -1,65 +1,91 @@
-# trafficgen/session.py (ready-to-drop)
-import asyncio
+# trafficgen/session.py — one ab-test shopper session.
+#
+# 1. Land on the store (referrer header + matching UTM tags).
+# 2. Add 1-3 random products from /shop-all/.
+# 3. Header CART -> "View Cart" -> /cart.php.
+# 4. Sticky checkout banner shown  -> click it, complete checkout with the
+#    test card.  Only the primary "Check out" button -> end the session.
+#
+# Selectors are fixed and were verified on noibudemo.com (Cornerstone theme).
+import atexit
 import contextlib
 import os
 import random
-import re
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode, urlparse, urljoin
+import time
+from typing import List, Optional
+from urllib.parse import urlencode
 
-from trafficgen.utils import (
-    biased_index,
-    ExponentialBackoff,
-    choose_weighted,
-    debug_print,
-    same_origin,
-    think,
-    weighted_value,
-)
-from trafficgen import attribution
 from trafficgen import checkout as checkout_engine
+from trafficgen.devices import desktop_context_args
+from trafficgen.utils import debug_print, think, weighted_choice
 
-ALLOW_NAV_TIMEOUT = 25000
-SEL_TIMEOUT = 15000
+NAV_TIMEOUT_MS = 25_000
 
+# Referer header sent on the landing request for each REFERRER_SOURCES entry.
+REFERER_URLS = {
+    "google": "https://www.google.com/",
+    "bing": "https://www.bing.com/",
+    "yahoo": "https://search.yahoo.com/",
+    "duckduckgo": "https://duckduckgo.com/",
+    "facebook": "https://www.facebook.com/",
+    "instagram": "https://www.instagram.com/",
+    "tiktok": "https://www.tiktok.com/",
+    "linkedin": "https://www.linkedin.com/",
+    "reddit": "https://www.reddit.com/",
+}
+
+
+def _csv(name: str, default: str = "") -> List[str]:
+    return [x.strip() for x in os.getenv(name, default).split(",") if x.strip()]
+
+
+def _floats(name: str) -> List[float]:
+    out = []
+    for x in _csv(name):
+        try:
+            out.append(float(x))
+        except ValueError:
+            out.append(0.0)
+    return out
+
+
+def _kv(name: str) -> dict:
+    out = {}
+    for pair in _csv(name):
+        if ":" in pair:
+            k, v = pair.split(":", 1)
+            out[k.strip().lower()] = v.strip()
+    return out
+
+
+# ── A/B outcome tally ────────────────────────────────────────────────────────
 
 class _ABTally:
-    """Process-wide A/B outcome counter for the ab-test scenario.
+    """Process-wide outcome counter.
 
-    Prints an [AB SUMMARY] line every AB_SUMMARY_EVERY finished sessions
-    (default 5), or when AB_SUMMARY_MINUTES (default 30) have passed since the
-    last summary, and once more when the process exits.
+    Prints an [AB SUMMARY] every AB_SUMMARY_EVERY finished sessions (default
+    5), or when AB_SUMMARY_MINUTES (default 30) have passed since the last
+    one, and a final summary when the process exits.
     """
-    OUTCOMES = (
-        ("control", "control"),
-        ("sticky_ordered", "sticky: order placed"),
-        ("sticky_order_failed", "sticky: order NOT confirmed"),
-        ("sticky_no_checkout", "sticky: checkout didn't load"),
-        ("no_cart", "never reached cart"),
-        ("no_items", "nothing added"),
-    )
+    OUTCOMES = ("control", "sticky_ordered", "sticky_order_failed",
+                "sticky_no_checkout", "no_cart", "no_items")
 
     def __init__(self):
-        import time as _t
-        self._time = _t
         self.started = 0
-        self.counts = {k: 0 for k, _ in self.OUTCOMES}
-        self.t0 = _t.time()
+        self.counts = {k: 0 for k in self.OUTCOMES}
+        self.t0 = time.time()
         self.last_print = self.t0
         self.every = max(1, int(os.getenv("AB_SUMMARY_EVERY", "5")))
         self.minutes = max(1.0, float(os.getenv("AB_SUMMARY_MINUTES", "30")))
-        import atexit
         atexit.register(lambda: self.started and self.print_summary("final"))
 
     def start(self):
         self.started += 1
 
     def record(self, outcome: str):
-        self.counts[outcome] = self.counts.get(outcome, 0) + 1
+        self.counts[outcome] += 1
         finished = sum(self.counts.values())
-        due_n = finished % self.every == 0
-        due_t = (self._time.time() - self.last_print) >= self.minutes * 60
-        if due_n or due_t:
+        if finished % self.every == 0 or (time.time() - self.last_print) >= self.minutes * 60:
             self.print_summary()
 
     def print_summary(self, tag: str = ""):
@@ -68,9 +94,9 @@ class _ABTally:
         sticky = c["sticky_ordered"] + c["sticky_order_failed"] + c["sticky_no_checkout"]
         decided = c["control"] + sticky  # sessions that actually saw a variant
         pct = lambda n: f"{(100.0 * n / decided):.0f}%" if decided else "-"
-        mins = int((self._time.time() - self.t0) // 60)
-        since = self._time.strftime("%H:%M", self._time.localtime(self.t0))
-        lines = [
+        mins = int((time.time() - self.t0) // 60)
+        since = time.strftime("%H:%M", time.localtime(self.t0))
+        print("\n".join([
             f"[AB SUMMARY{(' ' + tag) if tag else ''}] {self.started} started, "
             f"{finished} finished since {since} ({mins // 60}h{mins % 60:02d}m)",
             f"  variant split : control {c['control']} ({pct(c['control'])}) | "
@@ -79,1864 +105,125 @@ class _ABTally:
             f"{c['sticky_order_failed']} | checkout didn't load {c['sticky_no_checkout']}",
             f"  no variant    : never reached cart {c['no_cart']} | nothing added "
             f"{c['no_items']} | unfinished/timed out {self.started - finished}",
-        ]
-        print("\n".join(lines), flush=True)
-        self.last_print = self._time.time()
+        ]), flush=True)
+        self.last_print = time.time()
 
 
 AB_TALLY = _ABTally()
 
-def _normalize_label(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
-def _slug_from_source(src: str) -> str:
-    if not src:
-        return ""
-    s = src.strip().lower()
-    if s == "direct":
-        return "direct"
-    try:
-        netloc = urlparse(s).netloc if "://" in s else s
-        netloc = re.sub(r"^www\.", "", netloc)
-        parts = netloc.split(".")
-        return parts[-2] if len(parts) >= 2 else netloc
-    except Exception:
-        return re.sub(r"\W+", "", s)
-
-def _parse_kv_csv(env_val: str, normalize_keys: bool = True) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    s = (env_val or "").strip()
-    if not s:
-        return out
-    for pair in s.split(","):
-        if ":" not in pair:
-            continue
-        k, v = pair.split(":", 1)
-        k = _normalize_label(k) if normalize_keys else k.strip()
-        out[k] = v.strip()
-    return out
-
-def _parse_list_csv(s: str) -> List[str]:
-    return [x.strip() for x in (s or "").split(",") if x.strip()]
-
-def _parse_float_csv(s: str) -> List[float]:
-    out: List[float] = []
-    for x in _parse_list_csv(s):
-        try:
-            out.append(float(x))
-        except Exception:
-            continue
-    return out
-
-def _parse_prob_csv(env_val: str) -> Dict[str, float]:
-    raw = _parse_kv_csv(env_val, normalize_keys=True)
-    out: Dict[str, float] = {}
-    for k, v in raw.items():
-        try:
-            out[k] = max(0.0, min(1.0, float(v)))
-        except Exception:
-            pass
-    return out
-
-def _parse_weight_overrides(env_val: str) -> Dict[str, float]:
-    raw = _parse_kv_csv(env_val, normalize_keys=True)
-    out: Dict[str, float] = {}
-    for k, v in raw.items():
-        try:
-            out[k] = max(float(v), 0.0)
-        except Exception:
-            continue
-    return out
-
-def _weighted_choice(items: List[str], weights: List[float]) -> Optional[str]:
-    if not items:
-        return None
-    if not weights or len(weights) != len(items):
-        return random.choice(items)
-    total = sum(max(0.0, w) for w in weights)
-    if total <= 0:
-        return random.choice(items)
-    r = random.uniform(0, total)
-    acc = 0.0
-    for it, w in zip(items, weights):
-        acc += max(0.0, w)
-        if r <= acc:
-            return it
-    return items[-1]
-
-
-def _prob_to_fraction(val: Any) -> Optional[float]:
-    if val is None:
-        return None
-    try:
-        f = float(val)
-    except Exception:
-        return None
-    if f > 1:
-        f = f / 100.0
-    return max(0.0, min(1.0, f))
+# ── session ──────────────────────────────────────────────────────────────────
 
 class Session:
-    def __init__(self,
-                 session_id: int,
-                 browser,
-                 playwright,
-                 origin: str,
-                 allowlist_roots: List[str],
-                 device_context_args: Dict[str, Any],
-                 locale: str,
-                 timezone_id: str,
-                 allow_checkout: bool,
-                 checkout_complete_rate: float,
-                 flows: List[dict],
-                 think_cfg: Dict[str, int],
-                 global_qps,
-                 debug: bool = False,
-                 fault_profile: Optional[dict] = None,
-                 referrer_url: Optional[str] = None,
-                 persona: Optional[Dict[str, Any]] = None,
-                 may_place_order=None):
+    LISTING_PATHS = ["/shop-all/", "/shop-all/?page=2"]
+    PRODUCT_LINK_SEL = "article.card .card-title a"
+    ADD_TO_CART_SEL = "#form-action-addToCart"
+    ADDED_MODAL_SEL = "#previewModal.open"
+    ADDED_MODAL_CLOSE_SEL = "#previewModal .modal-close"
+    HEADER_CART_SEL = "a[data-cart-preview]"
+    VIEW_CART_SEL = "#cart-preview-dropdown .previewCartAction-viewCart a"
+    STICKY_SEL = "[data-cart-sticky-checkout]:not([hidden]) a[data-sticky-checkout-now-action]"
+    PRIMARY_SEL = "a[data-primary-checkout-now-action]"
+    FLAG_KEY = "3393-desktop-cart-sticky-checkout-cta"
+
+    def __init__(self, session_id: int, browser, origin: str, debug: bool = True):
         self.id = session_id
         self.browser = browser
-        self.playwright = playwright
         self.origin = origin.rstrip("/")
-        self.allowlist = allowlist_roots
-        self.ctx_args = device_context_args or {}
-        self.locale = locale
-        self.tz = timezone_id
-        self.allow_checkout = allow_checkout
-        self.checkout_rate = float(checkout_complete_rate or 0.0)
-        self.flows = flows
-        self.think_cfg = think_cfg or {"page_min_ms":800,"page_max_ms":3000,"scroll_min_ms":200,"scroll_max_ms":1000}
-        self.global_qps = global_qps
         self.debug = debug
-        self.fault_profile = fault_profile or {}
-        self.persona = persona if isinstance(persona, dict) else None
-        self.may_place_order = may_place_order
-        self.flow_weight_overrides = _parse_weight_overrides(os.getenv("FLOW_WEIGHTS", ""))
-
-        # UTM source (legacy env choice supplied by Runner)
-        self.referrer_url = (referrer_url or "").strip() or None
-        if self.referrer_url and self.referrer_url.lower() == "direct":
-            self.referrer_url = "direct"
-
-        # UTM/env
-        self.utm_medium_default = os.getenv("UTM_MEDIUM_DEFAULT", "paid-social")
-        self.utm_campaign_default = os.getenv("UTM_CAMPAIGN_DEFAULT", "trafficgen")
-        self.utm_mediums = _parse_kv_csv(os.getenv("REFERRER_UTM_MEDIUMS", ""), normalize_keys=True)
-
-        # NEW: explicit header URLs; weights reuse existing REFERRER_WEIGHTS
-        self.ref_hdr_urls = _parse_list_csv(os.getenv("REFERRER_HEADER_URLS", ""))
-        self.ref_hdr_weights = _parse_float_csv(os.getenv("REFERRER_WEIGHTS", ""))
-
-        # Human-like behavior
-        self.wait_until = os.getenv("PAGE_WAIT_UNTIL", "load").strip().lower()
-        if self.wait_until not in ("load","domcontentloaded","networkidle"):
-            self.wait_until = "load"
-        self.post_nav_settle_min = int(os.getenv("POST_NAV_SETTLE_MIN_MS","250"))
-        self.post_nav_settle_max = int(os.getenv("POST_NAV_SETTLE_MAX_MS","900"))
-        self.scroll_prob = float(os.getenv("SCROLL_PROB","0.70"))
-        self.scroll_depth_min = float(os.getenv("SCROLL_DEPTH_MIN","0.35"))
-        self.scroll_depth_max = float(os.getenv("SCROLL_DEPTH_MAX","0.90"))
-        self.scroll_steps_min = int(os.getenv("SCROLL_STEPS_MIN","2"))
-        self.scroll_steps_max = int(os.getenv("SCROLL_STEPS_MAX","6"))
-
-        # Post-load pauses
-        self.micro_pause_min_ms = int(os.getenv("PAGE_MICRO_PAUSE_MIN_MS","90"))
-        self.micro_pause_max_ms = int(os.getenv("PAGE_MICRO_PAUSE_MAX_MS","280"))
-        self.idle_after_page_prob = float(os.getenv("PAGE_IDLE_PROB","0.14"))
-        self.idle_after_page_min_ms = int(os.getenv("PAGE_IDLE_MIN_MS","1400"))
-        self.idle_after_page_max_ms = int(os.getenv("PAGE_IDLE_MAX_MS","5200"))
-
-        # Per-step jitter
-        self.step_jitter_pause_min = int(os.getenv("STEP_JITTER_PAUSE_MIN_MS","120"))
-        self.step_jitter_pause_max = int(os.getenv("STEP_JITTER_PAUSE_MAX_MS","600"))
-        self.step_jitter_scroll_prob = float(os.getenv("STEP_JITTER_SCROLL_PROB","0.35"))
-        self.step_jitter_scroll_depth_min = float(os.getenv("STEP_JITTER_SCROLL_DEPTH_MIN","0.08"))
-        self.step_jitter_scroll_depth_max = float(os.getenv("STEP_JITTER_SCROLL_DEPTH_MAX","0.45"))
-        self.step_jitter_scroll_steps_min = int(os.getenv("STEP_JITTER_SCROLL_STEPS_MIN","1"))
-        self.step_jitter_scroll_steps_max = int(os.getenv("STEP_JITTER_SCROLL_STEPS_MAX","3"))
-
-        # Tile hover heatmaps
-        self.tile_hover_prob = float(os.getenv("CATEGORY_TILE_HOVER_PROB","0.6"))
-        self.tile_hover_count_min = int(os.getenv("CATEGORY_TILE_HOVER_MIN","2"))
-        self.tile_hover_count_max = int(os.getenv("CATEGORY_TILE_HOVER_MAX","5"))
-        self.tile_hover_dwell_min_ms = int(os.getenv("CATEGORY_TILE_HOVER_DWELL_MIN_MS","160"))
-        self.tile_hover_dwell_max_ms = int(os.getenv("CATEGORY_TILE_HOVER_DWELL_MAX_MS","520"))
-
-        # Top-nav & hotspots
-        self.nav_weights = _parse_kv_csv(os.getenv("NAV_CATEGORY_WEIGHTS",""), normalize_keys=True)
-        self.nav_hotspot_names = [_normalize_label(x) for x in os.getenv("NAV_HOTSPOT_NAMES","Kitchen,Bath").split(",") if x.strip()]
-        self.nav_hotspot_extra_prob = _parse_prob_csv(os.getenv("NAV_HOTSPOT_EXTRA_CLICK_PROB","Kitchen:0.65,Bath:0.45"))
-        self.nav_pause_min = int(os.getenv("NAV_NAVIGATION_PAUSE_MS_MIN","400"))
-        self.nav_pause_max = int(os.getenv("NAV_NAVIGATION_PAUSE_MS_MAX","1100"))
-
-        # Coverage pass
-        self.coverage_prob = float(os.getenv("COVERAGE_RUN_PROB","0.15"))
-        self.coverage_max_clicks = int(os.getenv("COVERAGE_MAX_CLICKS","8"))
-        self.coverage_allow = [s.strip() for s in os.getenv("COVERAGE_SELECTOR_ALLOW",".hero a,.promo a,.featured a,.card a,button,.btn").split(",") if s.strip()]
-        self.coverage_block = [s.strip() for s in os.getenv("COVERAGE_SELECTOR_BLOCK",'[href*="logout"],[href^="mailto:"],[href^="tel:"],[href*="admin"],.social a').split(",") if s.strip()]
-
-        # Device-aware browsing depth. Desktop shoppers browse more products
-        # per session than phone users; mobile stays shallow/quick.
-        self.is_desktop = not bool(self.ctx_args.get("is_mobile", False))
-        _pdp_d_min = int(os.getenv("PDP_VISITS_DESKTOP_MIN", "3"))
-        _pdp_d_max = int(os.getenv("PDP_VISITS_DESKTOP_MAX", "6"))
-        _pdp_m_min = int(os.getenv("PDP_VISITS_MOBILE_MIN", "1"))
-        _pdp_m_max = int(os.getenv("PDP_VISITS_MOBILE_MAX", "2"))
-        self.pdp_visits = (_pdp_d_min, _pdp_d_max) if self.is_desktop else (_pdp_m_min, _pdp_m_max)
-        self.pdp_visit_cap = int(os.getenv("PDP_VISITS_MAX_CAP", "6"))
-
-        # Funnel gating
-        self.funnel_atc_rate = float(os.getenv("FUNNEL_ADD_TO_CART_RATE","0.30"))
-        self.funnel_checkout_rate = float(os.getenv("FUNNEL_CHECKOUT_START_RATE","0.50"))
-        self.funnel_max_cart_adds = int(os.getenv("FUNNEL_MAX_CART_ADDS_PER_SESSION","1"))
-        self.funnel_max_checkout_starts = int(os.getenv("FUNNEL_MAX_CHECKOUT_STARTS_PER_SESSION","1"))
-        # Persona funnel probabilities take precedence over FUNNEL_* env rates.
-        persona_funnel = (self.persona or {}).get("funnel")
-        if isinstance(persona_funnel, dict):
-            self.flag_bounce = (random.random() < float(persona_funnel.get("bounce", 0.0) or 0.0))
-            atc_rate = float(persona_funnel.get("add_to_cart", self.funnel_atc_rate) or 0.0)
-            checkout_start_rate = float(persona_funnel.get("checkout_start", self.funnel_checkout_rate) or 0.0)
-        else:
-            self.flag_bounce = False
-            atc_rate = self.funnel_atc_rate
-            checkout_start_rate = self.funnel_checkout_rate
-        self.flag_is_atc_session = (not self.flag_bounce) and (random.random() < atc_rate)
-        self.flag_should_checkout = (self.flag_is_atc_session and (random.random() < checkout_start_rate))
-        self.did_add_to_cart = 0
-        self.did_start_checkout = 0
-        self.did_complete_checkout = 0
-        self.stop_requested = False
-        self._apply_flow_weight_overrides()
-        self._apply_persona_flow_overrides()
-        self._flow_weights_available = any(isinstance(f, dict) and "weight" in f for f in self.flows)
-
-        # ── Broken-checkout scenario (see trafficgen/flows/broken-checkout.yaml)
-        # One low-frequency session that fills a cart, enters checkout with an
-        # OFFLINE payment method (bank deposit / cash on delivery), fails to
-        # place the order, retries a random number of times, then leaves.
-        self.bc_products = max(1, int(os.getenv("BROKEN_CHECKOUT_PRODUCTS", "3")))
-        self.bc_methods = [
-            m.strip() for m in os.getenv(
-                "BROKEN_CHECKOUT_PAYMENT_METHODS", "bank,cod"
-            ).split(",") if m.strip()
-        ] or ["bank", "cod"]
-        self.bc_retry_min = max(0, int(os.getenv("BROKEN_CHECKOUT_RETRY_MIN", "1")))
-        self.bc_retry_max = max(
-            self.bc_retry_min, int(os.getenv("BROKEN_CHECKOUT_RETRY_MAX", "7"))
-        )
-        self.bc_wait_min = float(os.getenv("BROKEN_CHECKOUT_RETRY_WAIT_MIN_S", "5"))
-        self.bc_wait_max = float(os.getenv("BROKEN_CHECKOUT_RETRY_WAIT_MAX_S", "20"))
-
-        # ── A/B-test scenario (see trafficgen/flows/ab-test.yaml)
-        # Cart 1..N random products, open the cart via the header preview,
-        # then branch on which checkout button the cart page renders:
-        # sticky banner (variant) -> complete the order with the test card;
-        # primary button only (control) -> end the session.
-        self.ab_products_min = max(1, int(os.getenv("AB_TEST_PRODUCTS_MIN", "1")))
-        self.ab_products_max = max(
-            self.ab_products_min, int(os.getenv("AB_TEST_PRODUCTS_MAX", "3"))
-        )
-        self.ab_sticky_wait_ms = int(os.getenv("AB_TEST_STICKY_WAIT_MS", "6000"))
-
-        # Search
-        self.search_terms = _parse_list_csv(os.getenv(
-            "SEARCH_TERMS",
-            "faucet,sink,shower,towel,mirror,lighting,vanity,fixture,soap,kitchen,bathroom,storage,rug,mat",
-        )) or ["sale", "new", "gift"]
-
-        self.page = None
         self.context = None
-
-    async def _new_context(self):
-        cargs = dict(self.ctx_args)
-        cargs["locale"] = self.locale
-        cargs["timezone_id"] = self.tz
-        cargs.setdefault("ignore_https_errors", True)
-        # 3-layer no-cache treatment (all sessions): CloudFront varies cache
-        # on Referer; cached cross-referrer responses broke Noibu loading.
-        cargs["service_workers"] = "block"
-        self.context = await self.browser.new_context(**cargs)
-        await attribution.apply_no_cache(self.context)
-        self.page = await self.context.new_page()
-
-    def _apply_flow_weight_overrides(self):
-        if not self.flow_weight_overrides:
-            return
-        for f in self.flows:
-            if not isinstance(f, dict):
-                continue
-            name = _normalize_label(f.get("name") or "")
-            if not name:
-                continue
-            if name in self.flow_weight_overrides:
-                f["weight"] = self.flow_weight_overrides[name]
-
-    def _apply_persona_flow_overrides(self):
-        overrides = (self.persona or {}).get("flow_overrides")
-        if not isinstance(overrides, dict) or not overrides:
-            return
-        norm = {_normalize_label(str(k)): v for k, v in overrides.items()}
-        # Copy flow dicts so per-persona multipliers never mutate shared state.
-        self.flows = [dict(f) if isinstance(f, dict) else f for f in self.flows]
-        for f in self.flows:
-            if not isinstance(f, dict):
-                continue
-            name = _normalize_label(f.get("name") or "")
-            if name not in norm:
-                continue
-            try:
-                mult = max(float(norm[name]), 0.0)
-            except Exception:
-                continue
-            try:
-                base = float(f.get("weight", 1) or 1)
-            except Exception:
-                base = 1.0
-            f["weight"] = base * mult
-
-    def _pick_flow(self) -> Optional[dict]:
-        if not self.flows:
-            return None
-        if self._flow_weights_available:
-            return choose_weighted(self.flows, key="weight") or self.flows[0]
-        return random.choice(self.flows)
-
-    async def _guarded_goto(self, url: str, referer: Optional[str] = None):
-        if not same_origin(url, self.allowlist):
-            return
-        await self.global_qps.wait()
-        backoff = ExponentialBackoff()
-        while True:
-            try:
-                await self.page.goto(
-                    url,
-                    timeout=ALLOW_NAV_TIMEOUT,
-                    wait_until=self.wait_until,
-                    referer=referer,
-                )
-                await asyncio.sleep(random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000))
-                await self._post_load_idle_pause()
-                return
-            except Exception:
-                await backoff.wait()
-                if backoff.attempts > 5:
-                    raise
-
-    async def _post_load_idle_pause(self):
-        pause_ms = random.randint(
-            min(self.micro_pause_min_ms, self.micro_pause_max_ms),
-            max(self.micro_pause_min_ms, self.micro_pause_max_ms),
-        )
-        await asyncio.sleep(pause_ms / 1000.0)
-        if random.random() < max(0.0, min(1.0, self.idle_after_page_prob)):
-            idle_ms = random.randint(
-                min(self.idle_after_page_min_ms, self.idle_after_page_max_ms),
-                max(self.idle_after_page_min_ms, self.idle_after_page_max_ms),
-            )
-            debug_print(self.debug, f"[S{self.id}] idle after load for {idle_ms}ms")
-            await asyncio.sleep(idle_ms / 1000.0)
-
-    async def _maybe_scroll_page(self,
-                                prob: Optional[float] = None,
-                                depth_min: Optional[float] = None,
-                                depth_max: Optional[float] = None,
-                                steps_min: Optional[int] = None,
-                                steps_max: Optional[int] = None):
-        probability = self.scroll_prob if prob is None else prob
-        depth_min = self.scroll_depth_min if depth_min is None else depth_min
-        depth_max = self.scroll_depth_max if depth_max is None else depth_max
-        steps_min = self.scroll_steps_min if steps_min is None else steps_min
-        steps_max = self.scroll_steps_max if steps_max is None else steps_max
-
-        if random.random() > max(0.0, min(1.0, probability)):
-            debug_print(self.debug, f"[S{self.id}] no scroll (randomized)")
-            return
-        try:
-            await self.page.wait_for_selector("body", timeout=SEL_TIMEOUT)
-        except Exception:
-            return
-        try:
-            height = await self.page.evaluate("""
-                () => {
-                  const d=document.documentElement,b=document.body;
-                  const vals=[d.scrollHeight,b.scrollHeight,d.offsetHeight,b.offsetHeight,d.clientHeight,b.clientHeight].filter(v=>typeof v==='number');
-                  const h=Math.max(...vals,0); return (h && isFinite(h))?h:2000;
-                }
-            """)
-        except Exception:
-            height = 2000
-        depth_frac = max(0.0, min(1.0, random.uniform(depth_min, depth_max)))
-        target = max(400, height * depth_frac)
-        steps = max(1, min(10, random.randint(steps_min, steps_max)))
-        for _ in range(steps):
-            await self.page.mouse.wheel(0, target/steps)
-            await think(self.think_cfg["scroll_min_ms"], self.think_cfg["scroll_max_ms"])
-
-    async def run(self):
         self.page = None
-        self.context = None
-        backoff = ExponentialBackoff(base=0.4, factor=1.7, max_wait=3.0)
-        last_exc: Optional[Exception] = None
-        for attempt in range(3):
-            try:
-                await self._new_context()
-                break
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                last_exc = exc
-                debug_print(self.debug, f"[S{self.id}] new_context failed (attempt {attempt + 1}): {exc}")
-                await backoff.wait()
-        else:
-            if last_exc is not None:
-                raise last_exc
-            raise RuntimeError("browser context creation failed")
-        try:
-            if self.persona is not None and self.flag_bounce:
-                await self._bounce_session()
-                return
-            flow = self._pick_flow()
-            if not flow:
-                return
-            await self._run_scripted(flow)
-        finally:
-            debug_print(self.debug, f"[S{self.id}] summary: atc={self.did_add_to_cart} checkout={self.did_start_checkout} completed={self.did_complete_checkout}")
-            if self.context:
-                with contextlib.suppress(Exception):
-                    await self.context.close()
-            self.context = None
-            self.page = None
 
-    def _pdp_visit_count(self) -> int:
-        """How many products to browse this session (device-aware)."""
-        lo, hi = self.pdp_visits
-        return random.randint(min(lo, hi), max(lo, hi))
-
-    async def _desktop_extra_browse(self):
-        """Desktop-only: after the main flow, browse a few more products,
-        returning to a listing between PDPs so the journey spans several
-        products instead of ending on the first one."""
-        visits = self._pdp_visit_count()
-        debug_print(self.debug, f"[S{self.id}] desktop extra browse: up to {visits} products")
-        for _ in range(visits):
-            if self.stop_requested:
-                break
-            with contextlib.suppress(Exception):
-                await self._open_random_category({})
-            if self.stop_requested:
-                break
-            if not await self._open_product_link():
-                break
-            await self._maybe_scroll_page(prob=0.85, depth_min=0.2, depth_max=0.6, steps_min=2, steps_max=5)
-            await self._post_load_idle_pause()
-            await think(self.think_cfg["page_min_ms"], self.think_cfg["page_max_ms"])
-
-    async def _run_scripted(self, flow: dict):
-        steps = flow.get("steps", [])
-        await self._landing()
-        # Funnel-first for persona ATC sessions: do the PDP → add-to-cart →
-        # checkout work while the session budget is fresh; browse afterwards.
-        # (Previously the nav walk + flow steps frequently consumed the whole
-        # session timeout, so atc/checkout never ran.)
-        if self.persona is not None and self.flag_is_atc_session and not self.flag_bounce:
-            await self._open_random_pdp(count=2)  # 2 = one retry if first link isn't a PDP
-            if self.stop_requested:
-                return
-        # A flow can opt out of the header walk (the broken-checkout scenario
-        # needs its whole time budget for the cart + retry loop).
-        if not bool(flow.get("skip_nav_walk", False)):
-            await self._topnav_click_all_with_hotspots()
-        for step in steps:
-            if self.stop_requested:
-                break
-            await self._execute_step(step)
-            if self.stop_requested:
-                break
-            await self._apply_step_jitter()
-            if self.stop_requested:
-                break
-            await think(self.think_cfg["page_min_ms"], self.think_cfg["page_max_ms"])
-        if (not self.stop_requested) and random.random() < self.coverage_prob:
-            await self._coverage_click_pass()
-        # Desktop shoppers keep browsing more products after the scripted flow.
-        if self.is_desktop and (not self.stop_requested) and not self.flag_bounce:
-            await self._desktop_extra_browse()
-
-    async def _bounce_session(self):
-        """Persona bounce: land, glance (light/no scroll), dwell 3-10s, leave."""
-        landing = attribution.landing_url(self.origin, self.persona)
-        referer_hdr = attribution.referer_header(self.persona)
-        debug_print(self.debug, f"[S{self.id}] persona '{(self.persona or {}).get('name')}' BOUNCE landing: {landing} | referer={referer_hdr or 'none'}")
-        await self._guarded_goto(landing, referer=referer_hdr)
-        await self._maybe_scroll_page(prob=0.35, depth_min=0.05, depth_max=0.25, steps_min=1, steps_max=2)
-        await asyncio.sleep(random.uniform(3.0, 10.0))
-
-    async def _landing(self):
-        # Persona attribution takes precedence over legacy REFERRER_* env logic.
-        if self.persona is not None:
-            landing = attribution.landing_url(self.origin, self.persona)
-            referer_hdr = attribution.referer_header(self.persona)
-            debug_print(self.debug, f"[S{self.id}] persona '{self.persona.get('name')}' landing: {landing} | referer={referer_hdr or 'none'}")
-            await self._guarded_goto(landing, referer=referer_hdr)
-            try:
-                ref = await self.page.evaluate("document.referrer")
-                debug_print(self.debug, f"[S{self.id}] document.referrer='{ref}'")
-            except Exception:
-                pass
-            await self._maybe_scroll_page()
-            return
-
-        landing = self.origin + "/"
-        referer_hdr: Optional[str] = None
-
-        # Header source: REFERRER_HEADER_URLS if set, weights reuse REFERRER_WEIGHTS
-        if self.ref_hdr_urls:
-            chosen = _weighted_choice(self.ref_hdr_urls, self.ref_hdr_weights)
-            if chosen:
-                chosen = chosen.strip()
-                if chosen.lower() != "direct":
-                    if chosen.startswith("http://") or chosen.startswith("https://"):
-                        referer_hdr = chosen
-                    else:
-                        slug = _slug_from_source(chosen)
-                        referer_hdr = self._default_referrer_url_from_slug(slug)
-        else:
-            # Fallback header from legacy referrer
-            if self.referrer_url and self.referrer_url != "direct":
-                if self.referrer_url.startswith("http://") or self.referrer_url.startswith("https://"):
-                    referer_hdr = self.referrer_url
-                else:
-                    referer_hdr = self._default_referrer_url_from_slug(_slug_from_source(self.referrer_url))
-
-        # UTM from legacy vars (keep old behavior)
-        if self.referrer_url and self.referrer_url != "direct":
-            utm_source = _slug_from_source(self.referrer_url)
-            utm_medium = self.utm_mediums.get(utm_source, self.utm_medium_default)
-            utm_campaign = self.utm_campaign_default
-            q = {"utm_source": utm_source, "utm_medium": utm_medium, "utm_campaign": utm_campaign}
-            sep = "?" if "?" not in landing else "&"
-            landing = landing + sep + urlencode(q)
-            if referer_hdr:
-                debug_print(self.debug, f"[S{self.id}] landing with REFERER: {referer_hdr} | {landing}")
-            else:
-                debug_print(self.debug, f"[S{self.id}] landing (utm only): {landing}")
-        else:
-            debug_print(self.debug, f"[S{self.id}] landing direct")
-
-        await self._guarded_goto(landing, referer=referer_hdr)
-
-        try:
-            ref = await self.page.evaluate("document.referrer")
-            debug_print(self.debug, f"[S{self.id}] document.referrer='{ref}'")
-        except Exception:
-            pass
-
-        await self._maybe_scroll_page()
-
-    def _default_referrer_url_from_slug(self, slug: str) -> str:
-        default_map = {
-            "google": "https://www.google.com/",
-            "bing": "https://www.bing.com/",
-            "yahoo": "https://search.yahoo.com/",
-            "duckduckgo": "https://duckduckgo.com/",
-            "facebook": "https://www.facebook.com/",
-            "instagram": "https://www.instagram.com/",
-            "tiktok": "https://www.tiktok.com/",
-            "linkedin": "https://www.linkedin.com/",
-            "reddit": "https://www.reddit.com/",
-        }
-        return default_map.get(slug, f"https://www.{slug}.com/")
-
-    async def _apply_step_jitter(self):
-        pause_ms = random.randint(
-            min(self.step_jitter_pause_min, self.step_jitter_pause_max),
-            max(self.step_jitter_pause_min, self.step_jitter_pause_max),
-        )
-        await asyncio.sleep(pause_ms / 1000.0)
-        await self._maybe_scroll_page(
-            prob=self.step_jitter_scroll_prob,
-            depth_min=self.step_jitter_scroll_depth_min,
-            depth_max=self.step_jitter_scroll_depth_max,
-            steps_min=self.step_jitter_scroll_steps_min,
-            steps_max=self.step_jitter_scroll_steps_max,
-        )
-
-    def _should_run_step(self, step: dict) -> bool:
-        prob = _prob_to_fraction(step.get("probability", step.get("prob")))
-        if prob is None:
-            return True
-        if random.random() <= prob:
-            return True
-        debug_print(self.debug, f"[S{self.id}] skipping step (probability {prob})")
-        return False
-
-    async def _execute_step(self, step: dict):
-        if not isinstance(step, dict):
-            return
-        if not self._should_run_step(step):
-            return
-
-        if "choose_one" in step or "choices" in step:
-            await self._execute_choose_one(step)
-            return
-        if "repeat" in step:
-            await self._execute_repeat(step)
-            return
-
-        await self._execute_action(step)
-
-    async def _execute_action(self, step: dict):
-        kind = step.get("action")
-        if kind == "open_random_category":
-            await self._open_random_category(step)
-        elif kind == "category_explore":
-            await self._category_explore(step)
-        elif kind == "category_hotspot_click":
-            await self._category_hotspot_click(step)
-        elif kind == "open_random_pdp":
-            await self._open_random_pdp(count=int(step.get("count", 1)))
-        elif kind == "home_explore":
-            await self._home_explore()
-        elif kind == "sort_or_filter":
-            await self._sort_or_filter()
-        elif kind == "add_to_cart":
-            await self._add_to_cart()
-        elif kind == "pdp_explore":
-            await self._pdp_explore(step)
-        elif kind == "pdp_decision":
-            await self._pdp_decision(step)
-        elif kind == "view_cart":
-            await self._view_cart()
-        elif kind == "cart_edit":
-            await self._cart_edit(step)
-        elif kind == "start_checkout":
-            await self._start_checkout()
-        elif kind == "checkout_start":
-            await self._checkout_start()
-        elif kind == "broken_checkout":
-            await self._broken_checkout(step)
-        elif kind == "ab_test_checkout":
-            await self._ab_test_checkout(step)
-        elif kind == "content_browse":
-            await self._content_browse(step)
-        elif kind == "content_page":
-            await self._content_page(step.get("slug",""))
-        elif kind == "search":
-            await self._search(step)
-        elif kind == "search_result_explore":
-            await self._search_result_explore()
-        elif kind == "exit_session":
-            debug_print(self.debug, f"[S{self.id}] exit_session requested")
-            self.stop_requested = True
-
-    async def _execute_choose_one(self, step: dict):
-        choices = step.get("choose_one") or step.get("choices") or []
-        if not isinstance(choices, list) or not choices:
-            return
-        choice = None
-        if all(isinstance(c, dict) for c in choices):
-            choice = choose_weighted(choices, key="weight")
-        if choice is None:
-            choice = random.choice(choices)
-        if isinstance(choice, dict) and choice.get("steps"):
-            for sub in choice.get("steps", []):
-                if self.stop_requested:
-                    break
-                await self._execute_step(sub)
-        elif isinstance(choice, list):
-            for sub in choice:
-                if self.stop_requested:
-                    break
-                await self._execute_step(sub)
-        elif isinstance(choice, dict):
-            await self._execute_step(choice)
-
-    async def _execute_repeat(self, step: dict):
-        repeat_spec = step.get("repeat")
-        steps = step.get("steps", [])
-        count = 0
-        if isinstance(repeat_spec, int):
-            count = repeat_spec
-        elif isinstance(repeat_spec, dict):
-            count = int(repeat_spec.get("times", repeat_spec.get("count", 1)))
-            steps = repeat_spec.get("steps", steps)
-        count = max(1, min(count or 1, 10))
-        for _ in range(count):
-            if self.stop_requested:
-                break
-            for sub in steps:
-                if self.stop_requested:
-                    break
-                await self._execute_step(sub)
-
-    def _extract_category_spec(self, step: Optional[dict]) -> Optional[dict]:
-        if not isinstance(step, dict):
-            return None
-        if "category" in step:
-            val = step.get("category")
-            if isinstance(val, dict):
-                name = val.get("name") or val.get("label")
-                return {"name": name, "url": val.get("url")}
-            if isinstance(val, str) and val.strip():
-                return {"name": val}
-        if isinstance(step.get("category_name"), str) and step.get("category_name", "").strip():
-            return {"name": step.get("category_name")}
-        cats = step.get("categories")
-        if isinstance(cats, list) and cats:
-            choice = None
-            if all(isinstance(c, dict) for c in cats):
-                choice = choose_weighted(cats, key="weight") or cats[0]
-            else:
-                names = [c for c in cats if isinstance(c, str) and c.strip()]
-                if names:
-                    choice = random.choice(names)
-            if isinstance(choice, dict):
-                name = choice.get("name") or choice.get("label")
-                return {"name": name, "url": choice.get("url")}
-            if isinstance(choice, str):
-                return {"name": choice}
-        return None
-
-    def _match_nav_link(self, links: List[Tuple[str, any]], target_norm: str):
-        for label_norm, el in links:
-            if label_norm == target_norm:
-                return el
-        for label_norm, el in links:
-            if target_norm in label_norm or label_norm in target_norm:
-                return el
-        return None
-
-    def _choose_weighted_nav_link(self, links: List[Tuple[str, any]]):
-        weighted = []
-        for label_norm, el in links:
-            weight = float(self.nav_weights.get(label_norm, 1.0)) if self.nav_weights else 1.0
-            weighted.append({"label": label_norm, "el": el, "weight": weight})
-        choice = choose_weighted(weighted, key="weight") if weighted else None
-        return choice.get("el") if isinstance(choice, dict) else None
-
-    async def _query_top_nav_links(self) -> List[Tuple[str, any]]:
-        selectors = [
-            "header nav a",
-            '[role="navigation"] a',
-            ".navPages-container a",
-            ".navPages a",
-            ".header-nav a",
-            "nav a",
-        ]
-        seen: Dict[str, any] = {}
-        for sel in selectors:
-            try:
-                loc = self.page.locator(sel)
-                count = await loc.count()
-                for i in range(min(count, 150)):
-                    el = loc.nth(i)
-                    try:
-                        text = (await el.inner_text(timeout=800)).strip()
-                        if not text:
-                            continue
-                        key = _normalize_label(text)
-                        href = await el.get_attribute("href", timeout=300) or ""
-                        if not href:
-                            continue
-                        url = urljoin(self.origin + "/", href)
-                        if not same_origin(url, self.allowlist):
-                            continue
-                        if key and key not in seen:
-                            seen[key] = el
-                    except Exception:
-                        continue
-            except Exception:
-                continue
-        out = []
-        for key, el in seen.items():
-            try:
-                href = await el.get_attribute("href", timeout=200) or ""
-                if href.rstrip("/").endswith(self.origin.rstrip("/")):
-                    continue
-            except Exception:
-                pass
-            out.append((key, el))
-        return out
-
-    async def _topnav_click_all_with_hotspots(self):
-        links = await self._query_top_nav_links()
-        if not links:
-            debug_print(self.debug, f"[S{self.id}] top-nav: none found")
-            return
-        random.shuffle(links)
-        # Cap the nav walk: clicking EVERY header link at 3-8s per page burned
-        # the whole session budget (240s timeouts) before any PDP/cart step
-        # ran. Funnel-flagged sessions browse 1-2 nav pages, others a few.
-        max_links = int(os.getenv("NAV_MAX_LINKS", "4"))
-        if self.persona is not None and self.flag_is_atc_session:
-            max_links = min(max_links, 2)
-        for label_norm, el in links[:max(1, max_links)]:
-            if self.stop_requested:
-                break
-            await self._click_nav_el(label_norm, el)
-        for hot in self.nav_hotspot_names:
-            if self.stop_requested:
-                break
-            label = _normalize_label(hot)
-            prob = self.nav_hotspot_extra_prob.get(label, 0.0)
-            if prob > 0 and random.random() < prob:
-                target = next(((ln, e) for (ln, e) in links if ln == label), None)
-                if target:
-                    await self._click_nav_el(target[0], target[1])
-
-    async def _click_nav_el(self, label_norm: str, el):
-        try:
-            box = await el.bounding_box()
-            if box:
-                await self.page.mouse.move(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
-            await el.click(timeout=SEL_TIMEOUT)
-            debug_print(self.debug, f"[S{self.id}] nav click → {label_norm}")
-        except Exception:
-            try:
-                href = await el.get_attribute("href", timeout=500)
-                if href:
-                    url = urljoin(self.origin + "/", href)
-                    debug_print(self.debug, f"[S{self.id}] nav goto (fallback) → {label_norm} ({url})")
-                    await self._guarded_goto(url)
-            except Exception:
-                return
-        await self._maybe_scroll_page()
-        await asyncio.sleep(random.uniform(self.nav_pause_min/1000, self.nav_pause_max/1000))
-        if not self.stop_requested:
-            await self._category_micro_behaviors()
-
-    async def _category_micro_behaviors(self):
-        await self._sort_or_filter()
-        await self._open_random_pdp(count=random.randint(1, 2))
-
-    def _home_scroll_depth(self) -> float:
-        buckets = [
-            {"depth": 0.20, "weight": 18},
-            {"depth": 0.50, "weight": 40},
-            {"depth": 0.80, "weight": 28},
-            {"depth": 1.00, "weight": 14},
-        ]
-        depth = weighted_value(
-            buckets,
-            value_key="depth",
-            weight_key="weight",
-            default=0.5,
-            jitter=(-0.06, 0.08),
-            clamp_min=0.05,
-            clamp_max=1.1,
-        )
-        try:
-            return float(depth)
-        except Exception:
-            return 0.5
-
-    async def _scroll_to_depth(self, depth: float):
-        try:
-            await self.page.wait_for_selector("body", timeout=SEL_TIMEOUT)
-        except Exception:
-            return
-        try:
-            metrics = await self.page.evaluate("""
-                () => {
-                  const d=document.documentElement,b=document.body;
-                  const vals=[d.scrollHeight,b.scrollHeight,d.offsetHeight,b.offsetHeight,d.clientHeight,b.clientHeight].filter(v=>typeof v==='number');
-                  const height=Math.max(...vals,0)||2000;
-                  return {height, y: window.scrollY || 0};
-                }
-            """)
-        except Exception:
-            metrics = {"height": 2000, "y": 0}
-        target = max(400, metrics.get("height", 2000) * depth)
-        current = float(metrics.get("y", 0) or 0.0)
-        delta = target - current
-        steps = max(1, min(8, random.randint(2, 5)))
-        distance = delta / steps if steps else delta
-        for _ in range(steps):
-            await self.page.mouse.wheel(0, distance)
-            await think(self.think_cfg["scroll_min_ms"], self.think_cfg["scroll_max_ms"])
-
-    async def _maybe_click_home_cta(self) -> bool:
-        selectors = [
-            ".hero a, .hero button, .hero-cta a, .hero-cta button, .banner a, .banner button, .jumbotron a, .jumbotron button",
-            ".featured-products a, .featured-collection a, .featured a, .featured-collections a",
-        ]
-        if random.random() > 0.55:
-            return False
-        for sel in selectors:
-            loc = self.page.locator(sel)
-            try:
-                count = await loc.count()
-            except Exception:
-                count = 0
-            if count <= 0:
-                continue
-            idx = random.randint(0, min(count - 1, 3))
-            try:
-                await loc.nth(idx).click(timeout=SEL_TIMEOUT)
-                await self._maybe_scroll_page(
-                    prob=0.65,
-                    depth_min=0.12,
-                    depth_max=0.35,
-                    steps_min=1,
-                    steps_max=3,
-                )
-                return True
-            except Exception:
-                continue
-        return False
-
-    async def _home_explore(self):
-        await self._guarded_goto(self.origin + "/")
-        segments = random.randint(1, 3)
-        last_depth = 0.0
-        for i in range(segments):
-            target_depth = self._home_scroll_depth()
-            if i > 0 and random.random() < 0.35:
-                target_depth = max(0.05, last_depth - random.uniform(0.08, 0.3))
-            await self._scroll_to_depth(target_depth)
-            last_depth = target_depth
-        if random.random() < 0.6:
-            await self._maybe_click_home_cta()
-
-    def _pick_search_term(self, step: Optional[dict]) -> str:
-        if isinstance(step, dict):
-            terms_spec = step.get("terms")
-            if isinstance(terms_spec, list) and terms_spec:
-                if all(isinstance(t, dict) for t in terms_spec):
-                    weighted = []
-                    for t in terms_spec:
-                        term_val = t.get("term") or t.get("value") or t.get("text")
-                        if term_val:
-                            weighted.append({"term": str(term_val), "weight": float(t.get("weight", 1.0) or 0.0)})
-                    choice = choose_weighted(weighted, key="weight") if weighted else None
-                    if isinstance(choice, dict) and choice.get("term"):
-                        return str(choice["term"])
-                else:
-                    str_terms = [str(t) for t in terms_spec if str(t).strip()]
-                    if str_terms:
-                        return random.choice(str_terms)
-        return random.choice(self.search_terms)
-
-    async def _find_search_input(self):
-        selectors = [
-            "input[type='search']",
-            "input[name*='search' i]",
-            "input[placeholder*='search' i]",
-            "input[aria-label*='search' i]",
-            "form[role='search'] input",
-            "form[action*='search' i] input",
-        ]
-        for sel in selectors:
-            loc = self.page.locator(sel)
-            try:
-                count = await loc.count()
-            except Exception:
-                count = 0
-            if count <= 0:
-                continue
-            for i in range(min(count, 3)):
-                candidate = loc.nth(i)
-                try:
-                    if await candidate.is_visible(timeout=SEL_TIMEOUT):
-                        return candidate
-                except Exception:
-                    continue
-        toggles = [
-            "button[aria-label*='search' i]",
-            "button:has-text('Search')",
-            "a[aria-label*='search' i]",
-            "a[href*='search']",
-        ]
-        for sel in toggles:
-            toggle = self.page.locator(sel).first
-            try:
-                if await toggle.is_visible(timeout=SEL_TIMEOUT):
-                    await toggle.click(timeout=SEL_TIMEOUT)
-                    break
-            except Exception:
-                continue
-        for sel in selectors:
-            loc = self.page.locator(sel)
-            try:
-                count = await loc.count()
-            except Exception:
-                count = 0
-            if count <= 0:
-                continue
-            for i in range(min(count, 3)):
-                candidate = loc.nth(i)
-                try:
-                    if await candidate.is_visible(timeout=SEL_TIMEOUT):
-                        return candidate
-                except Exception:
-                    continue
-        return None
-
-    async def _submit_search_form(self, input_el):
-        if input_el is None:
-            return
-        try:
-            await input_el.press("Enter", timeout=SEL_TIMEOUT)
-            return
-        except Exception:
-            pass
-        try:
-            form = input_el.locator("xpath=ancestor::form[1]")
-            buttons = form.locator("button[type='submit'],input[type='submit']")
-            if await buttons.count() > 0:
-                await buttons.first.click(timeout=SEL_TIMEOUT)
-                return
-        except Exception:
-            pass
-        try:
-            buttons = self.page.locator("button[aria-label*='search' i],button[type='submit'][name*='search' i]")
-            if await buttons.count() > 0:
-                await buttons.first.click(timeout=SEL_TIMEOUT)
-        except Exception:
-            return
-
-    async def _search(self, step: Optional[dict] = None):
-        term = self._pick_search_term(step)
-        input_el = await self._find_search_input()
-        if input_el is None:
-            debug_print(self.debug, f"[S{self.id}] search input not found")
-            return
-        try:
-            await input_el.click(timeout=SEL_TIMEOUT)
-            await input_el.fill(term, timeout=SEL_TIMEOUT)
-            debug_print(self.debug, f"[S{self.id}] search → '{term}'")
-        except Exception as exc:
-            debug_print(self.debug, f"[S{self.id}] search fill failed: {exc}")
-            return
-        await self._submit_search_form(input_el)
-        with contextlib.suppress(Exception):
-            await self.page.wait_for_load_state(self.wait_until, timeout=ALLOW_NAV_TIMEOUT)
-            await asyncio.sleep(random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000))
-        await self._maybe_scroll_page(prob=0.85, depth_min=0.12, depth_max=0.32, steps_min=1, steps_max=3)
-
-    async def _search_result_explore(self):
-        await self._maybe_scroll_page(prob=0.95, depth_min=0.18, depth_max=0.45, steps_min=1, steps_max=3)
-        branch = random.random()
-        if branch < 0.6:
-            await self._click_category_tiles(random.randint(1, 2))
-        else:
-            await self._apply_category_filters(random.randint(1, 2))
-            await self._maybe_scroll_page(prob=0.75, depth_min=0.1, depth_max=0.35, steps_min=1, steps_max=3)
-            if random.random() < 0.35:
-                await self._randomize_category_sort()
-
-    async def _open_random_category(self, step: Optional[dict] = None):
-        spec = self._extract_category_spec(step)
-        target_raw = spec.get("name") if isinstance(spec, dict) else ""
-        target_name = _normalize_label(target_raw or "") if isinstance(spec, dict) and spec.get("name") else None
-        target_url = (spec.get("url") or "").strip() if isinstance(spec, dict) else ""
-        if target_url:
-            dest = urljoin(self.origin + "/", target_url)
-            await self._guarded_goto(dest)
-            await self._maybe_scroll_page()
-            return
-
-        links = await self._query_top_nav_links()
-        chosen_el = None
-        if target_name and links:
-            chosen_el = self._match_nav_link(links, target_name)
-        if chosen_el is None and links:
-            chosen_el = self._choose_weighted_nav_link(links)
-        if chosen_el:
-            await self._click_category_element(chosen_el)
-            return
-
-        if target_raw:
-            try:
-                target_candidates = self.page.get_by_role("link", name=re.compile(re.escape(target_raw), re.I))
-                tcount = await target_candidates.count()
-                if tcount > 0:
-                    idx = biased_index(tcount, focus=4)
-                    await target_candidates.nth(idx).click(timeout=SEL_TIMEOUT)
-                    await self._maybe_scroll_page()
-                    return
-            except Exception:
-                pass
-
-        nav_candidates = self.page.get_by_role("link", name=re.compile("(Shop|All|Kitchen|Bath|Accessories|Sale|New)", re.I))
-        count = await nav_candidates.count()
-        if count > 0 and random.random() < 0.7:
-            idx = random.randint(0, min(count-1, 5))
-            await nav_candidates.nth(idx).click(timeout=SEL_TIMEOUT)
-        else:
-            await self._guarded_goto(f"{self.origin}/categories/")
-        await self._maybe_scroll_page()
-
-    async def _click_category_element(self, el):
-        try:
-            await el.click(timeout=SEL_TIMEOUT)
-        except Exception:
-            try:
-                href = await el.get_attribute("href", timeout=500) or ""
-                if href:
-                    await self._guarded_goto(urljoin(self.origin + "/", href))
-            except Exception:
-                return
-        await self._maybe_scroll_page()
-
-    async def _open_product_link(self) -> bool:
-        """Open a random product page robustly.
-
-        Try a human-like click on a VISIBLE product link first (themes such
-        as Dawn render a hidden 0x0 duplicate of every card link, which makes
-        index-based clicks hang on visibility checks). If the click fails for
-        any reason, fall back to harvesting hrefs and navigating directly —
-        the clmod3-proven path. Never raises; returns success.
-        """
-        # BigCommerce (Cornerstone) product URLs are root-level slugs, NOT
-        # /products/..., so harvest from product CARDS (clmod3-proven
-        # selector set) plus the Shopify-style pattern.
-        harvest_sel = (
-            ".card a.card-figure__link, .card-figure a[href], .card a[href], "
-            "a.card-title, a.product-title, a[href*='/products/']"
-        )
-        click_sel = (
-            "a.card-figure__link:visible, a.card-figure:visible, a.card-title:visible, "
-            "a.product-title:visible, a[href*='/products/']:visible"
-        )
-        start_url = self.page.url
-        try:
-            vis = self.page.locator(click_sel)
-            n = await vis.count()
-            if n > 0:
-                i = random.randint(0, min(n - 1, 15))
-                await vis.nth(i).click(timeout=6000)
-                await self.page.wait_for_load_state("load", timeout=ALLOW_NAV_TIMEOUT)
-                if self.page.url != start_url:
-                    return True
-        except Exception:
-            debug_print(self.debug, f"[S{self.id}] product tile click failed; goto fallback")
-        # Fallback: harvest hrefs and navigate directly.
-        try:
-            hrefs = await self.page.eval_on_selector_all(
-                harvest_sel,
-                """els => [...new Set(els.map(a => a.getAttribute('href'))
-                    .filter(h => h && h.length > 1 && !h.startsWith('#')
-                        && !h.includes('cart.php') && !h.includes('compare')
-                        && !h.includes('login') && !h.includes('mailto:')))]""",
-            )
-        except Exception:
-            hrefs = []
-        if not hrefs:
-            debug_print(self.debug, f"[S{self.id}] no product links found on {start_url}")
-            return False
-        href = random.choice(hrefs)
-        url = href if href.startswith("http") else self.origin.rstrip("/") + "/" + href.lstrip("/")
-        try:
-            await self._guarded_goto(url)
-            debug_print(self.debug, f"[S{self.id}] pdp via goto → {url}")
-            return True
-        except Exception:
-            return False
-
-    async def _open_random_pdp(self, count: int = 1):
-        count = max(1, min(count, self.pdp_visit_cap))
-        for _ in range(count):
-            if self.stop_requested:
-                break
-            if await self._open_product_link():
-                await self._maybe_scroll_page()
-                if self.flag_is_atc_session and self.did_add_to_cart < self.funnel_max_cart_adds:
-                    await self._add_to_cart()
-                    if self.flag_should_checkout and self.did_start_checkout < self.funnel_max_checkout_starts:
-                        await self._view_cart()
-                        await self._start_checkout()
-                        if self.did_start_checkout:
-                            debug_print(self.debug, f"[S{self.id}] checkout reached – pausing flow")
-                            self.stop_requested = True
-                            return
-            else:
-                break
-
-    async def _apply_category_filters(self, count: int):
-        count = max(0, min(count, 4))
-        if count <= 0:
-            return
-        selectors = [
-            ".facetedSearch-option--checkbox input",
-            "input[type='checkbox'][name*='filter']",
-            ".facetedSearch input[type='checkbox']",
-            "input[type='checkbox']",
-        ]
-        for sel in selectors:
-            loc = self.page.locator(sel)
-            try:
-                total = await loc.count()
-            except Exception:
-                total = 0
-            if total <= 0:
-                continue
-            picks = set()
-            for _ in range(count):
-                if len(picks) >= total:
-                    break
-                attempt = 0
-                idx = None
-                while attempt < 4:
-                    candidate = biased_index(total, focus=10)
-                    if candidate not in picks:
-                        idx = candidate
-                        break
-                    attempt += 1
-                if idx is None:
-                    continue
-                picks.add(idx)
-                try:
-                    await loc.nth(idx).check(timeout=SEL_TIMEOUT)
-                    await asyncio.sleep(random.uniform(0.2, 0.8))
-                except Exception:
-                    continue
-            break
-        await self._maybe_scroll_page()
-
-    async def _randomize_category_sort(self):
-        selectors = [
-            "select[name='sort']",
-            "select#sort",
-            "select[name*='Sort']",
-            "select[data-sort]",
-        ]
-        for sel in selectors:
-            dropdown = self.page.locator(sel).first
-            try:
-                options = await dropdown.locator("option").count()
-            except Exception:
-                options = 0
-            if options <= 1:
-                continue
-            try:
-                idx = biased_index(options, focus=4)
-                await dropdown.select_option(index=idx, timeout=SEL_TIMEOUT)
-                await self._maybe_scroll_page()
-                return
-            except Exception:
-                continue
-
-    async def _maybe_paginate_category(self) -> bool:
-        if random.random() < 0.4:
-            return False
-        selectors = [
-            "a[rel='next']",
-            "button[aria-label*='next' i]",
-            ".pagination a[aria-label*='next' i]",
-            ".pagination-item--next a",
-        ]
-        for sel in selectors:
-            loc = self.page.locator(sel)
-            try:
-                count = await loc.count()
-            except Exception:
-                count = 0
-            if count <= 0:
-                continue
-            idx = biased_index(count, focus=3)
-            try:
-                await loc.nth(idx).click(timeout=SEL_TIMEOUT)
-                await self.page.wait_for_load_state(self.wait_until, timeout=ALLOW_NAV_TIMEOUT)
-                await asyncio.sleep(random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000))
-                await self._post_load_idle_pause()
-                await self._maybe_scroll_page()
-                return True
-            except Exception:
-                continue
-        numeric = self.page.locator(".pagination a, nav[aria-label*='pagination' i] a")
-        try:
-            count = await numeric.count()
-        except Exception:
-            count = 0
-        if count <= 0:
-            return False
-        idx = biased_index(min(count, 6), focus=3)
-        try:
-            await numeric.nth(idx).click(timeout=SEL_TIMEOUT)
-            await self.page.wait_for_load_state(self.wait_until, timeout=ALLOW_NAV_TIMEOUT)
-            await asyncio.sleep(random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000))
-            await self._post_load_idle_pause()
-            await self._maybe_scroll_page()
-            return True
-        except Exception:
-            return False
-
-    async def _hover_category_tiles(self, count: int):
-        count = max(1, min(count, 8))
-        selector = "a.card-figure, a.card-title, a.product-title, a[href*='/products/']"
-        grid = self.page.locator(selector)
-        try:
-            total = await grid.count()
-        except Exception:
-            total = 0
-        if total <= 0:
-            return
-        seen: set = set()
-        dwell_min = min(self.tile_hover_dwell_min_ms, self.tile_hover_dwell_max_ms)
-        dwell_max = max(self.tile_hover_dwell_min_ms, self.tile_hover_dwell_max_ms)
-        for _ in range(count):
-            idx = biased_index(min(total, 60), focus=8)
-            if idx in seen:
-                continue
-            seen.add(idx)
-            try:
-                el = grid.nth(idx)
-                await el.hover(timeout=SEL_TIMEOUT)
-                await asyncio.sleep(random.uniform(dwell_min/1000, dwell_max/1000))
-            except Exception:
-                continue
-
-    async def _click_category_tiles(self, count: int):
-        count = max(1, min(count, self.pdp_visit_cap))
-        visited: set = set()
-        selector = "a.card-figure:visible, a.card-title:visible, a.product-title:visible, a[href*='/products/']:visible"
-        for i in range(count):
-            grid = self.page.locator(selector)
-            try:
-                total = await grid.count()
-            except Exception:
-                total = 0
-            if total <= 0:
-                break
-            choice = None
-            attempts = 0
-            while attempts < 5:
-                idx = biased_index(min(total, 40))
-                if idx not in visited:
-                    choice = idx
-                    break
-                attempts += 1
-            if choice is None:
-                choice = 0
-            visited.add(choice)
-            try:
-                await grid.nth(choice).click(timeout=6000)
-                await self._maybe_scroll_page(prob=0.85, depth_min=0.12, depth_max=0.35, steps_min=1, steps_max=3)
-            except Exception:
-                # Click failed (hidden/overlaid tile): goto-fallback keeps the
-                # session alive instead of burning the selector timeout budget.
-                if not await self._open_product_link():
-                    continue
-                await self._maybe_scroll_page(prob=0.85, depth_min=0.12, depth_max=0.35, steps_min=1, steps_max=3)
-            if i < count - 1:
-                with contextlib.suppress(Exception):
-                    await self.page.go_back(timeout=ALLOW_NAV_TIMEOUT, wait_until=self.wait_until)
-                    await asyncio.sleep(random.uniform(self.post_nav_settle_min/1000, self.post_nav_settle_max/1000))
-                    await self._post_load_idle_pause()
-                    await self._maybe_scroll_page(prob=0.65, depth_min=0.08, depth_max=0.22, steps_min=1, steps_max=2)
-
-    async def _category_explore(self, step: dict):
-        await self._open_random_category(step)
-        if self.stop_requested:
-            return
-        filters_to_apply = random.randint(0, 2)
-        if filters_to_apply > 0:
-            await self._apply_category_filters(filters_to_apply)
-        await self._randomize_category_sort()
-        await self._maybe_paginate_category()
-        hover_count = random.randint(
-            min(self.tile_hover_count_min, self.tile_hover_count_max),
-            max(self.tile_hover_count_min, self.tile_hover_count_max),
-        )
-        if random.random() < max(0.0, min(1.0, self.tile_hover_prob)):
-            await self._hover_category_tiles(hover_count)
-        await self._click_category_tiles(self._pdp_visit_count())
-
-    async def _category_hotspot_click(self, step: dict):
-        if any(k in (step or {}) for k in ("category", "categories", "category_name")):
-            await self._open_random_category(step)
-        selectors = [
-            ".category-hero a, .category-hero button, .collection-hero a, .collection-hero button",
-            ".category-banner a, .category-banner button, .collection-banner a, .collection-banner button",
-            ".category-promo a, .category-promo button, .promo-banner a, .promo-tile a, .promo a",
-        ]
-        for sel in selectors:
-            loc = self.page.locator(sel)
-            try:
-                count = await loc.count()
-            except Exception:
-                count = 0
-            if count <= 0:
-                continue
-            idx = biased_index(min(count, 6), focus=4)
-            try:
-                await loc.nth(idx).click(timeout=SEL_TIMEOUT)
-                await self._maybe_scroll_page(prob=0.75, depth_min=0.18, depth_max=0.4, steps_min=1, steps_max=3)
-                return
-            except Exception:
-                continue
-        await self._maybe_scroll_page(prob=0.4, depth_min=0.1, depth_max=0.3, steps_min=1, steps_max=2)
-
-    async def _sort_or_filter(self):
-        sort_prob = float(os.getenv("CATEGORY_SORT_PROB","0.30"))
-        filter_prob = float(os.getenv("CATEGORY_FILTER_PROB","0.15"))
-        if random.random() < sort_prob:
-            await self._randomize_category_sort()
-        if random.random() < filter_prob:
-            await self._apply_category_filters(1)
-
-    async def _add_to_cart(self, force: bool = False) -> bool:
-        """Click add-to-cart on the current PDP. Returns True when it clicked.
-
-        `force=True` bypasses FUNNEL_MAX_CART_ADDS_PER_SESSION — used by the
-        broken-checkout scenario, which deliberately builds a multi-item cart.
-        """
-        if (not force) and self.did_add_to_cart >= self.funnel_max_cart_adds:
-            return False
-        try:
-            btn = self.page.get_by_role("button", name=re.compile("add to cart", re.I))
-            await btn.first.click(timeout=SEL_TIMEOUT)
-            self.did_add_to_cart += 1
-            await think(800, 1800)  # let the cart-preview modal render
-            return True
-        except Exception:
-            pass
-        try:
-            await self.page.click("button#form-action-addToCart, button[name='add']", timeout=SEL_TIMEOUT)
-            self.did_add_to_cart += 1
-        except Exception:
-            return False
-        await think(500, 1200)
-        return True
-
-    async def _pdp_view_media(self):
-        selectors = [
-            ".productView-thumbnail img",
-            ".productView-thumbnails img",
-            ".productView-image--thumb img",
-            ".productView img",
-            "[data-image-gallery] img",
-        ]
-        for sel in selectors:
-            loc = self.page.locator(sel)
-            try:
-                total = await loc.count()
-            except Exception:
-                total = 0
-            if total <= 0:
-                continue
-            taps = random.randint(1, min(3, total))
-            visited = set()
-            for _ in range(taps):
-                idx = biased_index(min(total, 12), focus=4)
-                if idx in visited:
-                    continue
-                visited.add(idx)
-                with contextlib.suppress(Exception):
-                    await loc.nth(idx).click(timeout=SEL_TIMEOUT)
-                    await asyncio.sleep(random.uniform(0.15, 0.5))
-            break
-        try:
-            zoom_btns = self.page.get_by_role("button", name=re.compile("zoom", re.I))
-            zcount = await zoom_btns.count()
-        except Exception:
-            zcount = 0
-        if zcount > 0 and random.random() < 0.55:
-            idx = biased_index(min(zcount, 4), focus=2)
-            with contextlib.suppress(Exception):
-                await zoom_btns.nth(idx).click(timeout=SEL_TIMEOUT)
-                await asyncio.sleep(random.uniform(0.3, 0.9))
-                await self.page.keyboard.press("Escape")
-
-    async def _pdp_select_variant(self):
-        dropdowns = [
-            "form select[name*='option']",
-            "form select[id*='option']",
-            "form select[name*='attribute']",
-            "form select",
-        ]
-        for sel in dropdowns:
-            loc = self.page.locator(sel)
-            try:
-                total = await loc.count()
-            except Exception:
-                total = 0
-            if total <= 0:
-                continue
-            for i in range(total):
-                dropdown = loc.nth(i)
-                try:
-                    opts = await dropdown.locator("option").count()
-                except Exception:
-                    opts = 0
-                if opts <= 1:
-                    continue
-                try:
-                    idx = random.randint(1, opts - 1)
-                    await dropdown.select_option(index=idx, timeout=SEL_TIMEOUT)
-                    await asyncio.sleep(random.uniform(0.2, 0.5))
-                except Exception:
-                    continue
-                return
-        radio_selectors = [
-            "input[type='radio'][name*='option']",
-            ".form-radio input[type='radio']",
-            "input[type='radio'][name*='attribute']",
-        ]
-        for sel in radio_selectors:
-            loc = self.page.locator(sel)
-            try:
-                total = await loc.count()
-            except Exception:
-                total = 0
-            if total <= 0:
-                continue
-            idx = biased_index(min(total, 12), focus=5)
-            with contextlib.suppress(Exception):
-                await loc.nth(idx).check(timeout=SEL_TIMEOUT)
-                await asyncio.sleep(random.uniform(0.2, 0.5))
-                return
-
-    async def _pdp_scroll_to_reviews_or_description(self):
-        candidates: List[Any] = []
-        try:
-            links = self.page.get_by_role("link", name=re.compile("(review|rating|description|details|specs)", re.I))
-            lcount = await links.count()
-            for i in range(min(lcount, 5)):
-                candidates.append(links.nth(i))
-        except Exception:
-            pass
-        selectors = [
-            "#tab-description, #description, [id*='Description']",
-            "#tab-reviews, #reviews, [id*='Review']",
-            ".productView-description, .productView-details",
-        ]
-        for sel in selectors:
-            loc = self.page.locator(sel)
-            try:
-                count = await loc.count()
-            except Exception:
-                count = 0
-            if count > 0:
-                candidates.append(loc.first)
-        for target in candidates:
-            with contextlib.suppress(Exception):
-                await target.scroll_into_view_if_needed(timeout=SEL_TIMEOUT)
-                await self._maybe_scroll_page(
-                    prob=0.95,
-                    depth_min=0.18,
-                    depth_max=0.45,
-                    steps_min=1,
-                    steps_max=3,
-                )
-                return
-        await self._scroll_to_depth(random.uniform(0.35, 0.8))
-
-    async def _pdp_click_related_product(self):
-        selectors = [
-            "section.related-products a",
-            "[data-related-products] a",
-            "[data-recommended-products] a",
-            ".productRelated a",
-            ".upsell-products a",
-        ]
-        for sel in selectors:
-            loc = self.page.locator(sel)
-            try:
-                total = await loc.count()
-            except Exception:
-                total = 0
-            if total <= 0:
-                continue
-            idx = biased_index(min(total, 10), focus=4)
-            el = loc.nth(idx)
-            try:
-                await el.scroll_into_view_if_needed(timeout=SEL_TIMEOUT)
-                await asyncio.sleep(random.uniform(0.1, 0.3))
-                await el.click(timeout=SEL_TIMEOUT)
-                await self._maybe_scroll_page(
-                    prob=0.8,
-                    depth_min=0.1,
-                    depth_max=0.3,
-                    steps_min=1,
-                    steps_max=2,
-                )
-                return
-            except Exception:
-                continue
-
-    async def _pdp_explore(self, step: Optional[dict] = None):
-        await self._pdp_view_media()
-        await self._pdp_select_variant()
-        await self._pdp_scroll_to_reviews_or_description()
-        related_prob = float((step or {}).get("related_click_prob", 0.35))
-        if random.random() < max(0.0, min(1.0, related_prob)):
-            await self._pdp_click_related_product()
-
-    async def _pdp_decision(self, step: Optional[dict] = None):
-        step = step or {}
-        outcomes = [
-            {"outcome": "add_to_cart", "weight": float(step.get("add_to_cart_weight", step.get("add_weight", 0.6)) or 0.0)},
-            {"outcome": "bounce", "weight": float(step.get("bounce_weight", 1.0) or 0.0)},
-        ]
-        choice = choose_weighted(outcomes, key="weight") or outcomes[0]
-        outcome = (choice or {}).get("outcome", "bounce")
-        if outcome == "add_to_cart":
-            await self._add_to_cart()
-        else:
-            debug_print(self.debug, f"[S{self.id}] pdp_decision → bounce (ending session)")
-            self.stop_requested = True
-
-    async def _view_cart(self):
-        try:
-            link = self.page.get_by_role("link", name=re.compile("cart|view cart", re.I))
-            await link.first.click(timeout=SEL_TIMEOUT)
-        except Exception:
-            await self._guarded_goto(f"{self.origin}/cart.php")
-        await self._maybe_scroll_page()
-
-    async def _cart_edit(self, step: Optional[dict] = None):
-        remove_prob = float((step or {}).get("remove_prob", 0.18))
-        try:
-            items = self.page.locator(".cart-item, [data-cart-item], tr.cart-item")
-            count = await items.count()
-        except Exception:
-            count = 0
-        if count <= 0:
-            return
-        target_idx = biased_index(min(count, 6), focus=4)
-        row = items.nth(target_idx)
-        qty_locators = row.locator("input[name*='qty'], input[name='qty[]'], input[type='number']")
-        try:
-            qty_count = await qty_locators.count()
-        except Exception:
-            qty_count = 0
-        if qty_count > 0:
-            qty_input = qty_locators.first
-            try:
-                current_val = await qty_input.input_value(timeout=800)
-            except Exception:
-                current_val = ""
-            try:
-                new_qty = random.randint(1, 3)
-                if str(current_val).isdigit():
-                    if int(current_val) == new_qty and new_qty < 3:
-                        new_qty += 1
-                await qty_input.fill(str(new_qty), timeout=SEL_TIMEOUT)
-                with contextlib.suppress(Exception):
-                    await qty_input.press("Enter", timeout=SEL_TIMEOUT)
-                await asyncio.sleep(random.uniform(0.2, 0.6))
-            except Exception:
-                pass
-        if random.random() < max(0.0, min(1.0, remove_prob)):
-            selectors = [
-                "button[aria-label*='remove']",
-                "button[name='action'][value='delete']",
-                "button[name='delete']",
-                "button:has-text('Remove')",
-                "a:has-text('Remove')",
-                "a.cart-remove",
-            ]
-            for sel in selectors:
-                target = row.locator(sel)
-                try:
-                    if await target.count() > 0:
-                        await target.first.click(timeout=SEL_TIMEOUT)
-                        break
-                except Exception:
-                    continue
-        await self._maybe_scroll_page(prob=0.4, depth_min=0.08, depth_max=0.2, steps_min=1, steps_max=2)
-
-    async def _persona_checkout(self):
-        """Persona-driven checkout: proceed, then complete or abandon.
-
-        Completion requires the persona's checkout_complete roll AND the
-        global order rate limiter (may_place_order). Denied/failed rolls
-        abandon at a weighted random stage instead.
-        """
-        if self.did_start_checkout >= self.funnel_max_checkout_starts:
-            return
-        if not self.flag_should_checkout or self.did_add_to_cart <= 0:
-            return
-        funnel = (self.persona or {}).get("funnel") or {}
-        if not await checkout_engine.proceed_to_checkout(self.page, debug=self.debug):
-            return
-        self.did_start_checkout += 1
-        complete = random.random() < float(funnel.get("checkout_complete", 0.0) or 0.0)
-        forced_stage: Optional[str] = None
-        if complete:
-            allowed = True
-            if self.may_place_order is not None:
-                allowed = await self.may_place_order()
-            if not allowed:
-                debug_print(self.debug, f"[S{self.id}] order rate limit active; abandoning at payment instead")
-                complete = False
-                forced_stage = "payment"
-        if complete:
-            identity = checkout_engine.random_identity()
-            card = {
-                "number": os.getenv("CARD_NUMBER", "4111111111111111"),
-                "expiry": os.getenv("CARD_EXPIRY", "01/30"),
-                "cvv": os.getenv("CARD_CVV", "989"),
-            }
-            if await checkout_engine.complete_checkout(self.page, identity, card, debug=self.debug):
-                self.did_complete_checkout += 1
-                debug_print(self.debug, f"[S{self.id}] checkout COMPLETED")
-            else:
-                debug_print(self.debug, f"[S{self.id}] checkout completion failed")
-        else:
-            stage = forced_stage
-            if stage is None:
-                picked = choose_weighted([
-                    {"stage": "customer", "weight": 0.2},
-                    {"stage": "shipping", "weight": 0.3},
-                    {"stage": "payment", "weight": 0.5},
-                ], key="weight") or {}
-                stage = picked.get("stage", "payment")
-            await checkout_engine.abandon_checkout(self.page, stage, debug=self.debug)
-        self.stop_requested = True
-
-    async def _add_random_products(self, count: int) -> int:
-        """Add `count` DIFFERENT random products to the cart.
-
-        Re-enters a category listing before each product so every add is a
-        fresh navigation — that also clears the BigCommerce cart-preview
-        modal, which otherwise intercepts the next click.
-        """
-        added = 0
-        for i in range(max(1, count)):
-            if self.stop_requested:
-                break
-            with contextlib.suppress(Exception):
-                await self._open_random_category({})
-            if self.stop_requested:
-                break
-            if not await self._open_product_link():
-                debug_print(self.debug, f"[S{self.id}] bc: no product link for item {i + 1}")
-                continue
-            await self._maybe_scroll_page(prob=0.7, depth_min=0.15, depth_max=0.55,
-                                         steps_min=1, steps_max=4)
-            with contextlib.suppress(Exception):
-                await self._pdp_select_variant()
-            if await self._add_to_cart(force=True):
-                added += 1
-                debug_print(self.debug, f"[S{self.id}] bc: added product {added}/{count}")
-            else:
-                debug_print(self.debug, f"[S{self.id}] bc: add-to-cart failed for item {i + 1}")
-            await think(self.think_cfg["page_min_ms"], self.think_cfg["page_max_ms"])
-        return added
-
-    async def _broken_checkout(self, step: Optional[dict] = None):
-        """Broken-checkout scenario: cart N products, pay by bank/COD, fail, retry.
-
-        Retries are the FAILED submissions after the first one:
-        BROKEN_CHECKOUT_RETRY_MIN..MAX (default 1-7), so total Place Order
-        submissions = retries + 1. The session ends after the last attempt
-        whether or not the order ever went through.
-        """
-        step = step or {}
-        want = int(step.get("products", self.bc_products))
-        added = await self._add_random_products(want)
-        if added <= 0:
-            debug_print(self.debug, f"[S{self.id}] bc: nothing added to cart; ending")
-            self.stop_requested = True
-            return
-
-        await self._view_cart()
-        await self._maybe_scroll_page(prob=0.6, depth_min=0.1, depth_max=0.45,
-                                     steps_min=1, steps_max=3)
-
-        if not await checkout_engine.proceed_to_checkout(self.page, debug=self.debug):
-            debug_print(self.debug, f"[S{self.id}] bc: could not reach checkout; ending")
-            self.stop_requested = True
-            return
-        self.did_start_checkout += 1
-
-        method = random.choice(self.bc_methods)
-        retries = random.randint(self.bc_retry_min, self.bc_retry_max)
-        debug_print(
-            self.debug,
-            f"[S{self.id}] bc: {added} item(s) in cart, paying via '{method}', "
-            f"{retries} retry/retries planned ({retries + 1} submissions max)",
-        )
-        summary = await checkout_engine.complete_checkout_offline(
-            self.page,
-            checkout_engine.random_identity(),
-            method,
-            max_attempts=retries + 1,
-            wait_min=self.bc_wait_min,
-            wait_max=self.bc_wait_max,
-            debug=self.debug,
-        )
-        if summary.get("success"):
-            self.did_complete_checkout += 1
-        debug_print(
-            self.debug,
-            f"[S{self.id}] bc result: method={summary.get('label') or method} "
-            f"attempts={summary.get('attempts')} success={summary.get('success')} "
-            f"last_error={(summary.get('errors') or ['-'])[-1]}",
-        )
-        self.stop_requested = True
-
-    # ── A/B-test scenario ────────────────────────────────────────────────
-    # Deliberately simple: fixed URLs and fixed selectors, all verified on
-    # noibudemo.com (Cornerstone theme). No nav-walk heuristics.
-    AB_LISTING_PATHS = ["/shop-all/", "/shop-all/?page=2"]
-    AB_PRODUCT_LINK_SEL = "article.card .card-title a"
-    AB_ADD_TO_CART_SEL = "#form-action-addToCart"
-    AB_HEADER_CART_SEL = "a[data-cart-preview]"
-    AB_VIEW_CART_SEL = "#cart-preview-dropdown .previewCartAction-viewCart a"
-    AB_STICKY_SEL = "[data-cart-sticky-checkout]:not([hidden]) a[data-sticky-checkout-now-action]"
-    AB_PRIMARY_SEL = "a[data-primary-checkout-now-action]"
-
-    async def _ab_log_page(self, why: str):
-        """One line of context when a step fails (URL + title), so a bad run
-        says what page it was actually looking at."""
+        self.products_min = max(1, int(os.getenv("AB_TEST_PRODUCTS_MIN", "1")))
+        self.products_max = max(self.products_min, int(os.getenv("AB_TEST_PRODUCTS_MAX", "3")))
+        self.sticky_wait_ms = int(os.getenv("AB_TEST_STICKY_WAIT_MS", "6000"))
+        self.settle_min_ms = int(os.getenv("POST_NAV_SETTLE_MIN_MS", "1500"))
+        self.settle_max_ms = max(self.settle_min_ms, int(os.getenv("POST_NAV_SETTLE_MAX_MS", "3500")))
+        self.locale = random.choice(_csv("LOCALES", "en-US"))
+        self.timezone = random.choice(_csv("TIMEZONES", "America/Toronto"))
+
+    def log(self, msg: str):
+        debug_print(self.debug, f"[S{self.id}] {msg}")
+
+    async def _log_page(self, why: str):
+        """URL + title when a step fails, so the log shows what page it was on."""
         title = ""
         with contextlib.suppress(Exception):
             title = await self.page.title()
-        debug_print(self.debug, f"[S{self.id}] ab: {why} | url={self.page.url} | title={title!r}")
+        self.log(f"ab: {why} | url={self.page.url} | title={title!r}")
 
-    async def _ab_product_urls(self) -> List[str]:
+    # ── lifecycle ────────────────────────────────────────────────────────────
+
+    async def run(self):
+        self.context = await self.browser.new_context(
+            **desktop_context_args(),
+            locale=self.locale,
+            timezone_id=self.timezone,
+            ignore_https_errors=True,
+            service_workers="block",
+            # Stop CloudFront from serving a cached page fetched under a
+            # different Referer (that broke Noibu loading in the past).
+            extra_http_headers={"Cache-Control": "no-cache, no-store, must-revalidate",
+                                "Pragma": "no-cache"},
+        )
+        self.page = await self.context.new_page()
+        try:
+            await self._land()
+            await self._ab_test_checkout()
+        finally:
+            with contextlib.suppress(Exception):
+                await self.context.close()
+
+    async def _goto(self, url: str, referer: Optional[str] = None):
+        await self.page.goto(url, timeout=NAV_TIMEOUT_MS, wait_until="load", referer=referer)
+        await think(self.settle_min_ms, self.settle_max_ms)
+
+    async def _scroll_a_bit(self):
+        for _ in range(random.randint(1, 3)):
+            await self.page.mouse.wheel(0, random.randint(250, 600))
+            await think(200, 700)
+
+    # ── landing ──────────────────────────────────────────────────────────────
+
+    async def _land(self):
+        """Pick one traffic source; send its Referer and matching UTM tags."""
+        source = (weighted_choice(_csv("REFERRER_SOURCES", "direct"), _floats("REFERRER_WEIGHTS"))
+                  or "direct").lower()
+        url, referer = self.origin + "/", None
+        if source != "direct":
+            referer = REFERER_URLS.get(source)
+            medium = _kv("REFERRER_UTM_MEDIUMS").get(source, os.getenv("UTM_MEDIUM_DEFAULT", "referral"))
+            url += "?" + urlencode({"utm_source": source, "utm_medium": medium,
+                                    "utm_campaign": os.getenv("UTM_CAMPAIGN_DEFAULT", "trafficgen")})
+        self.log(f"landing: source={source} referer={referer or 'none'} | {url}")
+        await self._goto(url, referer=referer)
+        await self._scroll_a_bit()
+
+    # ── products ─────────────────────────────────────────────────────────────
+
+    async def _product_urls(self) -> List[str]:
         """Product URLs from the Shop All listing (both pages)."""
         urls: List[str] = []
-        for path in self.AB_LISTING_PATHS:
-            await self._guarded_goto(self.origin + path)
+        for path in self.LISTING_PATHS:
+            await self._goto(self.origin + path)
             try:
-                await self.page.wait_for_selector(self.AB_PRODUCT_LINK_SEL, timeout=15_000)
+                await self.page.wait_for_selector(self.PRODUCT_LINK_SEL, timeout=15_000)
             except Exception:
-                await self._ab_log_page(f"no product cards on {path}")
+                await self._log_page(f"no product cards on {path}")
                 continue
             hrefs = await self.page.eval_on_selector_all(
-                self.AB_PRODUCT_LINK_SEL, "els => els.map(a => a.href)"
-            )
+                self.PRODUCT_LINK_SEL, "els => els.map(a => a.href)")
             urls.extend(h for h in hrefs if h and h not in urls)
         return urls
 
-    async def _ab_add_product(self, url: str) -> bool:
-        """Open a PDP and click Add to Cart. Returns True when the store
-        confirmed the add (cart count went up)."""
-        await self._guarded_goto(url)
-        try:
-            btn = self.page.locator(self.AB_ADD_TO_CART_SEL)
-            await btn.wait_for(state="visible", timeout=10_000)
-            await self._ab_pick_required_options()
-            await think(600, 1500)
-            async with self.page.expect_response(
-                lambda r: "/remote/v1/cart/add" in r.url and r.request.method == "POST",
-                timeout=15_000,
-            ):
-                await btn.click()
-            await think(1200, 2200)
-            self.did_add_to_cart += 1
-            await self._ab_close_added_modal()
-            return True
-        except Exception as e:
-            await self._ab_log_page(f"add-to-cart failed ({type(e).__name__})")
-            return False
-
-    async def _ab_pick_required_options(self):
-        """Products with required options (e.g. size/colour swatches) won't
-        add until one is chosen: click the first choice of every required
-        radio group and pick the first real option of every required select."""
+    async def _pick_required_options(self):
+        """Products with required options (swatches, sizes) won't add until
+        one is chosen: take the first choice of every required radio group
+        and the first real option of every required select."""
         form = "form[data-cart-item-add]"
         names = await self.page.eval_on_selector_all(
             f"{form} input[type=radio][required]",
-            "els => [...new Set(els.map(e => e.name))]",
-        )
+            "els => [...new Set(els.map(e => e.name))]")
         for name in names:
             radio = self.page.locator(f'{form} input[type=radio][name="{name}"]').first
             rid = await radio.get_attribute("id")
@@ -1952,230 +239,128 @@ class Session:
             sel = selects.nth(i)
             with contextlib.suppress(Exception):
                 values = await sel.eval_on_selector_all(
-                    "option", "os => os.map(o => o.value).filter(v => v)"
-                )
+                    "option", "os => os.map(o => o.value).filter(v => v)")
                 if values:
                     await sel.select_option(values[0], timeout=5_000)
                     await think(300, 700)
         if names:
-            # let the theme re-price / re-enable the button for the variant
-            await think(800, 1500)
+            await think(800, 1500)  # let the theme re-price / re-enable the button
 
-    async def _ab_close_added_modal(self):
-        """After an add, BigCommerce opens the "added to cart" modal whose
-        backdrop covers the header CART link. Close it."""
-        modal = self.page.locator("#previewModal.open")
+    async def _close_added_modal(self):
+        """The "added to cart" modal's backdrop covers the header CART link."""
         try:
-            await modal.wait_for(state="visible", timeout=5_000)
+            await self.page.locator(self.ADDED_MODAL_SEL).wait_for(state="visible", timeout=5_000)
         except Exception:
             return
-        with contextlib.suppress(Exception):
-            await self.page.locator("#previewModal .modal-close").first.click(timeout=5_000)
+        try:
+            await self.page.locator(self.ADDED_MODAL_CLOSE_SEL).first.click(timeout=5_000)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await self.page.keyboard.press("Escape")
         with contextlib.suppress(Exception):
             await self.page.locator(".modal-background").wait_for(state="hidden", timeout=5_000)
+
+    async def _add_product(self, url: str) -> bool:
+        """Open a PDP and add it; True once POST /remote/v1/cart/add returns."""
+        await self._goto(url)
+        try:
+            btn = self.page.locator(self.ADD_TO_CART_SEL)
+            await btn.wait_for(state="visible", timeout=10_000)
+            await self._pick_required_options()
+            await think(600, 1500)
+            async with self.page.expect_response(
+                lambda r: "/remote/v1/cart/add" in r.url and r.request.method == "POST",
+                timeout=15_000,
+            ):
+                await btn.click()
+            await think(1200, 2200)
+            await self._close_added_modal()
+            return True
+        except Exception as e:
+            await self._log_page(f"add-to-cart failed ({type(e).__name__})")
+            return False
+
+    # ── cart ─────────────────────────────────────────────────────────────────
 
     async def _open_cart_via_preview(self) -> bool:
         """Header CART -> preview dropdown -> "View Cart" -> /cart.php."""
         try:
-            await self.page.locator(self.AB_HEADER_CART_SEL).first.click(timeout=10_000)
-            view = self.page.locator(self.AB_VIEW_CART_SEL).first
+            await self.page.locator(self.HEADER_CART_SEL).first.click(timeout=10_000)
+            view = self.page.locator(self.VIEW_CART_SEL).first
             await view.wait_for(state="visible", timeout=8_000)
             await think(400, 1100)
             await view.click()
             await self.page.wait_for_url("**/cart.php**", timeout=15_000)
             return True
         except Exception as e:
-            await self._ab_log_page(f"cart preview -> View Cart failed ({type(e).__name__}); goto /cart.php")
+            await self._log_page(f"cart preview -> View Cart failed ({type(e).__name__}); goto /cart.php")
             with contextlib.suppress(Exception):
-                await self._guarded_goto(f"{self.origin}/cart.php")
+                await self._goto(f"{self.origin}/cart.php")
             return "cart.php" in self.page.url
 
-    async def _ab_test_checkout(self, step: Optional[dict] = None):
-        """1) add 1-3 random products  2) CART -> View Cart
-        3) sticky banner shown -> click it, complete checkout with test card
-           only the primary button -> exit."""
-        step = step or {}
-        lo = int(step.get("products_min", self.ab_products_min))
-        hi = max(lo, int(step.get("products_max", self.ab_products_max)))
-        want = random.randint(lo, hi)
-        AB_TALLY.start()
+    async def _flag_diagnostics(self) -> dict:
+        """The theme asks window.NoibuFeatureFlag for FLAG_KEY and falls back
+        to "original" (control) if the SDK isn't there within 1s."""
+        with contextlib.suppress(Exception):
+            return await self.page.evaluate("""(key) => {
+                const ff = window.NoibuFeatureFlag;
+                let v = 'no-sdk';
+                try { if (ff) v = ff.getClient().getStringValue(key, 'original'); }
+                catch (e) { v = 'error: ' + e; }
+                return { sdk: !!ff, flag: v, vw: innerWidth };
+            }""", self.FLAG_KEY)
+        return {}
 
-        urls = await self._ab_product_urls()
-        if not urls:
-            debug_print(self.debug, f"[S{self.id}] ab: no products found; ending")
-            AB_TALLY.record("no_items")
-            self.stop_requested = True
-            return
+    # ── scenario ─────────────────────────────────────────────────────────────
+
+    async def _ab_test_checkout(self):
+        AB_TALLY.start()
+        want = random.randint(self.products_min, self.products_max)
+
+        urls = await self._product_urls()
         random.shuffle(urls)
         added = 0
         for url in urls:
             if added >= want:
                 break
-            if await self._ab_add_product(url):
+            if await self._add_product(url):
                 added += 1
-                debug_print(self.debug, f"[S{self.id}] ab: added {added}/{want} ← {url}")
+                self.log(f"ab: added {added}/{want} ← {url}")
         if added == 0:
-            debug_print(self.debug, f"[S{self.id}] ab: nothing added to cart; ending")
+            self.log("ab: nothing added to cart; ending")
             AB_TALLY.record("no_items")
-            self.stop_requested = True
             return
 
         if not await self._open_cart_via_preview():
-            debug_print(self.debug, f"[S{self.id}] ab: could not reach cart page; ending")
+            self.log("ab: could not reach cart page; ending")
             AB_TALLY.record("no_cart")
-            self.stop_requested = True
             return
 
-        # The theme decides the variant within ~1s of load (feature-flag wait).
-        sticky = self.page.locator(self.AB_STICKY_SEL).first
+        sticky = self.page.locator(self.STICKY_SEL).first
         try:
-            await sticky.wait_for(state="visible", timeout=self.ab_sticky_wait_ms)
+            await sticky.wait_for(state="visible", timeout=self.sticky_wait_ms)
         except Exception:
-            primary = await self.page.locator(self.AB_PRIMARY_SEL).first.is_visible()
-            # Why control? The theme asks window.NoibuFeatureFlag for flag
-            # "3393-desktop-cart-sticky-checkout-cta" and falls back to
-            # "original" if the SDK isn't there within 1s.
-            diag = {}
-            with contextlib.suppress(Exception):
-                diag = await self.page.evaluate("""() => {
-                    const ff = window.NoibuFeatureFlag;
-                    let v = 'no-sdk';
-                    try { if (ff) v = ff.getClient().getStringValue(
-                        '3393-desktop-cart-sticky-checkout-cta', 'original'); }
-                    catch (e) { v = 'error: ' + e; }
-                    return { sdk: !!ff, flag: v, vw: innerWidth };
-                }""")
-            debug_print(
-                self.debug,
-                f"[S{self.id}] ab result: variant=control items={added} "
+            primary = await self.page.locator(self.PRIMARY_SEL).first.is_visible()
+            diag = await self._flag_diagnostics()
+            self.log(
+                f"ab result: variant=control items={added} "
                 f"primary_button={'yes' if primary else 'no'} "
                 f"flag_sdk={'yes' if diag.get('sdk') else 'no'} flag={diag.get('flag')} "
-                f"vw={diag.get('vw')} -> exit",
-            )
+                f"vw={diag.get('vw')} -> exit")
             AB_TALLY.record("control")
-            self.stop_requested = True
             return
 
-        debug_print(self.debug, f"[S{self.id}] ab: sticky checkout banner visible -> checkout")
+        self.log("ab: sticky checkout banner visible -> checkout")
         await think(500, 1400)
         await sticky.click()
         try:
             await self.page.wait_for_url("**/checkout**", timeout=30_000)
         except Exception:
-            await self._ab_log_page("did not reach checkout after sticky click")
+            await self._log_page("did not reach checkout after sticky click")
             AB_TALLY.record("sticky_no_checkout")
-            self.stop_requested = True
             return
-        self.did_start_checkout += 1
         ok = await checkout_engine.complete_checkout(
             self.page, checkout_engine.random_identity(),
-            checkout_engine.default_card(), debug=self.debug,
-        )
-        if ok:
-            self.did_complete_checkout += 1
-        debug_print(self.debug, f"[S{self.id}] ab result: variant=sticky items={added} order_placed={ok}")
+            checkout_engine.default_card(), debug=self.debug)
+        self.log(f"ab result: variant=sticky items={added} order_placed={ok}")
         AB_TALLY.record("sticky_ordered" if ok else "sticky_order_failed")
-        self.stop_requested = True
-
-    async def _start_checkout(self):
-        if self.did_start_checkout >= self.funnel_max_checkout_starts:
-            return
-        if self.persona is not None:
-            await self._persona_checkout()
-            return
-        try:
-            btn = self.page.get_by_role("link", name=re.compile("checkout", re.I))
-            await btn.first.click(timeout=SEL_TIMEOUT)
-            self.did_start_checkout += 1
-        except Exception:
-            try:
-                await self.page.click("a[href*='/checkout']", timeout=SEL_TIMEOUT)
-                self.did_start_checkout += 1
-            except Exception:
-                return
-        await self._maybe_scroll_page()
-
-    async def _checkout_start(self):
-        await self._start_checkout()
-        if self.did_start_checkout:
-            debug_print(self.debug, f"[S{self.id}] checkout_start requested; ending session after checkout entry")
-            self.stop_requested = True
-
-    async def _content_page(self, slug: str):
-        slugs = ["/contact-us/","/shipping-returns/","/blog/","/help/"]
-        if slug and slug.startswith("/"):
-            slugs.insert(0, slug)
-        await self._guarded_goto(self.origin + random.choice(slugs))
-        await self._maybe_scroll_page()
-
-    async def _content_browse(self, step: Optional[dict] = None):
-        pages = step.get("pages") if isinstance(step, dict) else None
-        if not isinstance(pages, list) or not pages:
-            pages = ["/about-us/", "/contact-us/", "/shipping-returns/", "/blog/", "/help/"]
-        unique_pages = [p for p in pages if isinstance(p, str) and p.startswith("/")]
-        random.shuffle(unique_pages)
-        visit_count = random.randint(1, min(2, max(1, len(unique_pages))))
-        for slug in unique_pages[:visit_count]:
-            if self.stop_requested:
-                break
-            await self._content_page(slug)
-
-    async def _footer_explore(self, step: Optional[dict] = None):
-        try:
-            await self._scroll_to_depth(1.05)
-        except Exception:
-            with contextlib.suppress(Exception):
-                await self.page.mouse.wheel(0, 2000)
-        selectors = step.get("selectors") if isinstance(step, dict) else None
-        if not isinstance(selectors, list) or not selectors:
-            selectors = ["footer a[href]", "footer nav a[href]", "footer li a[href]"]
-        for sel in selectors:
-            loc = self.page.locator(sel)
-            try:
-                count = await loc.count()
-            except Exception:
-                count = 0
-            if count <= 0:
-                continue
-            idx = random.randint(0, min(count - 1, 8))
-            try:
-                await loc.nth(idx).click(timeout=SEL_TIMEOUT)
-                await self._maybe_scroll_page(prob=0.6, depth_min=0.15, depth_max=0.4, steps_min=1, steps_max=3)
-                return
-            except Exception:
-                continue
-        await self._maybe_scroll_page(prob=0.4, depth_min=0.05, depth_max=0.15, steps_min=1, steps_max=2)
-
-    async def _coverage_click_pass(self):
-        try:
-            await self.page.wait_for_selector("body", timeout=SEL_TIMEOUT)
-        except Exception:
-            return
-        allow = ", ".join(self.coverage_allow)
-        loc = self.page.locator(allow)
-        try:
-            total = await loc.count()
-        except Exception:
-            total = 0
-        if total == 0:
-            return
-        indices = list(range(min(total, 100)))
-        random.shuffle(indices)
-        clicks = 0
-        for i in indices:
-            if clicks >= self.coverage_max_clicks or self.stop_requested:
-                break
-            el = loc.nth(i)
-            try:
-                href = await el.get_attribute("href", timeout=200) or ""
-                for b in self.coverage_block:
-                    if "href*=" in b:
-                        needle = b.split('href*="',1)[1].rstrip('"]')
-                        if needle in href:
-                            raise Exception("blocked")
-                await el.click(timeout=SEL_TIMEOUT)
-                clicks += 1
-                await self._maybe_scroll_page()
-                await asyncio.sleep(random.uniform(0.2, 0.8))
-            except Exception:
-                continue

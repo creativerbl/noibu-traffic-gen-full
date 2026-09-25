@@ -1,447 +1,161 @@
-
+# trafficgen/runner.py — schedules ab-test sessions.
+#
+# Two scheduling modes:
+#   BACK_TO_BACK=1  next session starts 2-5s after a slot frees up
+#   BACK_TO_BACK=0  one session every 60/SESSIONS_PER_MINUTE seconds (±jitter)
+# MAX_CONCURRENCY caps how many run at once (1 = strictly one at a time).
 import asyncio
-import signal
-import random
 import contextlib
 import os
-import time
+import random
+import signal
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
 
 from playwright.async_api import async_playwright
 
-from trafficgen.devices import build_device_pool, pick_device
 from trafficgen.session import Session
-from trafficgen.utils import TokenBucket, debug_print
-from trafficgen import attribution
+from trafficgen.utils import debug_print
+
+
+def _f(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        return max(float(os.getenv(name, str(default))), minimum)
+    except ValueError:
+        return default
+
 
 @dataclass
 class RunnerConfig:
     origin: str
-    allowlist_roots: List[str]
-    sessions_per_minute: float
-    avg_session_minutes: float
+    debug: bool
+    headless: bool
     max_concurrency: int
-    global_qps_cap: float
-    checkout_complete_rate: float
-    allow_checkout: bool
-    device_mix: List[dict]
-    locales: List[str]
-    timezones: List[str]
-    flows: List[dict]
-    think_times: Dict[str, int]
-    smoke: bool = False
-    debug: bool = False
-    kill_switch_file: Optional[str] = None
-    referrers: Optional[List[Dict[str, Any]]] = None
+    session_max_seconds: float
+    browser_per_session: bool
+    back_to_back: bool
+    gap_min_s: float
+    gap_max_s: float
+    sessions_per_minute: float
+    jitter: float
 
-def _weighted_pick(items: List[Dict[str, Any]], key: str = "weight") -> Optional[Dict[str, Any]]:
-    if not items:
-        return None
-    weights = []
-    total = 0.0
-    for it in items:
-        try:
-            w = float(it.get(key, 0) or 0)
-        except Exception:
-            w = 0.0
-        if w < 0:
-            w = 0.0
-        weights.append(w)
-        total += w
-    if total <= 0:
-        import random as _r
-        return _r.choice(items)
-    import random as _r
-    r, acc = _r.uniform(0, total), 0.0
-    for it, w in zip(items, weights):
-        acc += w
-        if r <= acc:
-            return it
-    return items[-1]
+    @classmethod
+    def from_env(cls) -> "RunnerConfig":
+        gap_min = _f("BACK_TO_BACK_GAP_MIN_S", 2.0)
+        return cls(
+            origin=os.getenv("ORIGIN", "https://noibudemo.com").rstrip("/"),
+            debug=os.getenv("DEBUG", "1") == "1",
+            headless=os.getenv("HEADLESS", "1") != "0",
+            max_concurrency=max(1, int(_f("MAX_CONCURRENCY", 1, 1))),
+            session_max_seconds=_f("SESSION_MAX_SECONDS", 600, 30),
+            browser_per_session=os.getenv("BROWSER_PER_SESSION", "1") == "1",
+            back_to_back=os.getenv("BACK_TO_BACK", "1") == "1",
+            gap_min_s=gap_min,
+            gap_max_s=max(gap_min, _f("BACK_TO_BACK_GAP_MAX_S", 5.0)),
+            sessions_per_minute=_f("SESSIONS_PER_MINUTE", 0.0833333, 1e-6),
+            jitter=min(_f("SCHEDULER_JITTER", 0.15), 0.9),
+        )
 
-class OrderRateLimiter:
-    """Global rate limiter for completed orders.
-
-    An asyncio.Lock-protected timestamp: at most one completed order per
-    ORDER_MIN_INTERVAL_SECONDS across all concurrent sessions. Sessions call
-    may_place_order() right before completing checkout; if denied they
-    abandon at the payment stage instead.
-    """
-
-    def __init__(self, min_interval_s: float):
-        self.min_interval = max(float(min_interval_s or 0.0), 0.0)
-        self._lock = asyncio.Lock()
-        self._last_order_at = 0.0
-
-    async def may_place_order(self) -> bool:
-        async with self._lock:
-            now = time.monotonic()
-            if self._last_order_at and (now - self._last_order_at) < self.min_interval:
-                return False
-            self._last_order_at = now
-            return True
 
 class Runner:
     def __init__(self, cfg: RunnerConfig):
         self.cfg = cfg
         self.stop_event = asyncio.Event()
-        self.sem = asyncio.Semaphore(self.cfg.max_concurrency)
-        self.global_qps = TokenBucket(rate_per_sec=self.cfg.global_qps_cap)
+        self.sem = asyncio.Semaphore(cfg.max_concurrency)
         self.session_counter = 0
-        self.smoke_limit = 3 if self.cfg.smoke else None
+        self.consecutive_errors = 0  # back-off so a broken setup can't spin
 
-        # Personas (loaded once) + global order rate limiter
-        personas_file = os.getenv("PERSONAS_FILE", "trafficgen/personas.yaml")
-        self.personas = attribution.load_personas(personas_file)
-        if self.personas:
-            debug_print(self.cfg.debug, f"Loaded {len(self.personas)} personas from {personas_file}")
-        else:
-            debug_print(self.cfg.debug, f"No personas loaded from {personas_file}; using legacy referrer/funnel env config")
-        self.order_limiter = OrderRateLimiter(
-            self._parse_float_env("ORDER_MIN_INTERVAL_SECONDS", default=300.0, minimum=0.0)
-        )
+    def log(self, msg: str):
+        debug_print(self.cfg.debug, msg)
 
-        # Health + telemetry
-        self.restart_event = asyncio.Event()
-        self._pending_restart_reason: Optional[str] = None
-        self._consecutive_failures = 0
-        self._scheduler_cooldown_until = 0.0
-        self._scheduler_cooldown_logged = False
-        self.metrics: Dict[str, int] = {
-            "started": 0,
-            "completed": 0,
-            "failed": 0,
-            "timeouts": 0,
-            "browser_restarts": 0,
-        }
-
-        # Tunables with environment overrides
-        self._browser_failure_threshold = self._parse_int_env(
-            "BROWSER_FAILURE_THRESHOLD", default=5, minimum=1
+    async def _launch(self, pw):
+        return await pw.chromium.launch(
+            headless=self.cfg.headless,
+            args=["--disable-cache", "--disable-application-cache",
+                  "--disk-cache-size=0", "--aggressive-cache-discard"],
         )
-        self._scheduler_failure_threshold = self._parse_int_env(
-            "SCHEDULER_FAILURE_THRESHOLD", default=10, minimum=1
-        )
-        self._scheduler_cooldown_seconds = self._parse_float_env(
-            "SCHEDULER_COOLDOWN_SECONDS", default=15.0, minimum=1.0
-        )
-
-        avg_minutes = max(float(self.cfg.avg_session_minutes or 1.0), 0.5)
-        default_timeout = max(60.0, avg_minutes * 120.0)
-        self._session_timeout = self._parse_float_env(
-            "SESSION_MAX_SECONDS", default=default_timeout, minimum=30.0
-        )
-        # Desktop shoppers browse longer than phone users; give their sessions a
-        # larger time budget so they can visit several products before timing out.
-        self._desktop_session_mult = self._parse_float_env(
-            "DESKTOP_SESSION_MULT", default=2.0, minimum=1.0
-        )
-        self._mobile_session_mult = self._parse_float_env(
-            "MOBILE_SESSION_MULT", default=1.0, minimum=0.25
-        )
-
-        default_refresh_sessions = max(
-            50, int(self.cfg.sessions_per_minute * avg_minutes * 2) or 50
-        )
-        self._browser_session_refresh_limit = self._parse_int_env(
-            "BROWSER_MAX_SESSIONS", default=default_refresh_sessions, minimum=0
-        )
-        default_refresh_minutes = max(15.0, avg_minutes * 4.0)
-        refresh_minutes = self._parse_float_env(
-            "BROWSER_MAX_MINUTES", default=default_refresh_minutes, minimum=0.0
-        )
-        self._browser_refresh_seconds = refresh_minutes * 60.0 if refresh_minutes > 0 else 0.0
-
-        self._sessions_since_launch_success = 0
-        self._browser_launched_at = 0.0
-
-    @staticmethod
-    def _parse_int_env(key: str, default: int, minimum: int) -> int:
-        raw = os.getenv(key)
-        try:
-            if raw is None:
-                return max(default, minimum)
-            return max(int(raw), minimum)
-        except Exception:
-            return max(default, minimum)
-
-    @staticmethod
-    def _parse_float_env(key: str, default: float, minimum: float) -> float:
-        raw = os.getenv(key)
-        try:
-            if raw is None:
-                return max(default, minimum)
-            return max(float(raw), minimum)
-        except Exception:
-            return max(default, minimum)
 
     async def run(self):
         loop = asyncio.get_running_loop()
         for s in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(s, lambda s=s: asyncio.create_task(self._graceful_stop(s)))
-
-        headless = os.getenv("HEADLESS", "1") != "0"  # Chromium-only; headless by default
+            loop.add_signal_handler(s, self._request_stop)
         async with async_playwright() as pw:
-            device_pool = build_device_pool(self.cfg.device_mix)
-            while not self.stop_event.is_set():
-                browser = await self._launch_browser(pw)
-                self._on_browser_launch()
-                try:
-                    await self._schedule_loop(browser, pw, device_pool)
-                finally:
+            shared = None if self.cfg.browser_per_session else await self._launch(pw)
+            try:
+                await self._schedule_loop(pw, shared)
+            finally:
+                if shared is not None:
                     with contextlib.suppress(Exception):
-                        await browser.close()
-                self._log_metrics_snapshot("cycle complete")
-                if self.stop_event.is_set():
-                    break
-                if not self.restart_event.is_set():
-                    break
-                self.metrics["browser_restarts"] += 1
-                reason = self._pending_restart_reason or "unspecified"
-                debug_print(
-                    self.cfg.debug,
-                    f"Restarting browser #{self.metrics['browser_restarts']} (reason: {reason})",
-                )
-                self._pending_restart_reason = None
-                self.restart_event.clear()
-                await asyncio.sleep(random.uniform(1.0, 3.0))
+                        await shared.close()
 
-    def _on_browser_launch(self):
-        self._sessions_since_launch_success = 0
-        self._browser_launched_at = time.monotonic()
-        self._consecutive_failures = 0
-        self._scheduler_cooldown_until = 0.0
-        self._scheduler_cooldown_logged = False
-        debug_print(self.cfg.debug, "Browser launched and health counters reset")
+    def _request_stop(self):
+        if not self.stop_event.is_set():
+            self.log("Stop requested: letting running sessions finish… (Ctrl+C again to force)")
+            self.stop_event.set()
+            # A second Ctrl+C falls through to Python's default handler.
+            with contextlib.suppress(Exception):
+                asyncio.get_running_loop().remove_signal_handler(signal.SIGINT)
 
-    def _request_restart(self, reason: str):
-        if not self.restart_event.is_set():
-            self._pending_restart_reason = reason
-            debug_print(self.cfg.debug, f"Browser restart requested: {reason}")
-            self.restart_event.set()
-
-    def _register_session_result(self, success: bool, timed_out: bool = False):
-        if success:
-            self.metrics["completed"] += 1
-            self._consecutive_failures = 0
-            self._sessions_since_launch_success += 1
-            if self._scheduler_cooldown_until > 0:
-                self._scheduler_cooldown_until = 0.0
-                self._scheduler_cooldown_logged = False
-                debug_print(self.cfg.debug, "Scheduler cooldown reset after success")
-            self._maybe_schedule_browser_rotation()
-        else:
-            self.metrics["failed"] += 1
-            self._consecutive_failures += 1
-            if timed_out:
-                self.metrics["timeouts"] += 1
-            if self._consecutive_failures >= self._browser_failure_threshold:
-                self._request_restart(
-                    f"{self._consecutive_failures} consecutive session failures"
-                )
-            if self._consecutive_failures >= self._scheduler_failure_threshold:
-                self._open_scheduler_circuit()
-
-    def _maybe_schedule_browser_rotation(self):
-        if self.restart_event.is_set():
-            return
-        if self._browser_session_refresh_limit > 0 and self._sessions_since_launch_success >= self._browser_session_refresh_limit:
-            self._request_restart(
-                f"rotating browser after {self._sessions_since_launch_success} successful sessions"
-            )
-            return
-        if self._browser_refresh_seconds > 0 and (time.monotonic() - self._browser_launched_at) >= self._browser_refresh_seconds:
-            self._request_restart(
-                f"rotating browser after {self._browser_refresh_seconds/60:.1f} minutes"
-            )
-
-    def _open_scheduler_circuit(self):
-        until = time.monotonic() + self._scheduler_cooldown_seconds
-        if until <= self._scheduler_cooldown_until:
-            return
-        self._scheduler_cooldown_until = until
-        self._scheduler_cooldown_logged = False
-        debug_print(
-            self.cfg.debug,
-            f"Scheduler cooldown engaged for {self._scheduler_cooldown_seconds:.1f}s",
-        )
-
-    def _scheduler_circuit_active(self) -> bool:
-        if self._scheduler_cooldown_until <= 0:
+    async def _sleep_or_stop(self, seconds: float) -> bool:
+        """Sleep; return True if a stop was requested meanwhile."""
+        if self.stop_event.is_set():
+            return True
+        try:
+            await asyncio.wait_for(self.stop_event.wait(), timeout=seconds)
+            return True
+        except asyncio.TimeoutError:
             return False
-        now = time.monotonic()
-        if now >= self._scheduler_cooldown_until:
-            self._scheduler_cooldown_until = 0.0
-            self._scheduler_cooldown_logged = False
-            debug_print(self.cfg.debug, "Scheduler cooldown cleared")
-            return False
-        if not self._scheduler_cooldown_logged:
-            remaining = self._scheduler_cooldown_until - now
-            debug_print(
-                self.cfg.debug,
-                f"Scheduler backing off for {remaining:.1f}s after failures",
-            )
-            self._scheduler_cooldown_logged = True
-        return True
 
-    def _log_metrics_snapshot(self, context: str):
-        debug_print(
-            self.cfg.debug,
-            f"{context}: started={self.metrics['started']} completed={self.metrics['completed']} "
-            f"failed={self.metrics['failed']} timeouts={self.metrics['timeouts']} "
-            f"browser_restarts={self.metrics['browser_restarts']}",
-        )
-
-    async def _launch_browser(self, pw):
-        headless = os.getenv("HEADLESS", "1") != "0"
-        return await pw.chromium.launch(
-            headless=headless,
-            args=[
-                "--disable-cache",
-                "--disable-application-cache",
-                "--disk-cache-size=0",
-                "--aggressive-cache-discard",
-            ],
-        )
-
-    async def _schedule_loop(self, browser, pw, device_pool):
-        # NOTE: the floor here used to be 0.1/min, which silently clamped any
-        # slower rate (e.g. 1 session/hour = 0.01667/min) to a 10-minute
-        # interval. Keep it effectively unbounded so hourly rates work.
-        interval = max(60.0 / max(self.cfg.sessions_per_minute, 1e-6), 0.25)
-        jitter = min(max(self._parse_float_env("SCHEDULER_JITTER", default=0.15, minimum=0.0), 0.0), 0.9)
-        start_now = os.getenv("SCHEDULER_START_IMMEDIATELY", "0") == "1"
-        # BACK_TO_BACK=1: ignore SESSIONS_PER_MINUTE. Start the next session as
-        # soon as a slot frees up (with MAX_CONCURRENCY=1: when the previous
-        # session ends), after a short BACK_TO_BACK_GAP_S pause.
-        back_to_back = os.getenv("BACK_TO_BACK", "0") == "1"
-        gap_lo = self._parse_float_env("BACK_TO_BACK_GAP_MIN_S", default=2.0, minimum=0.0)
-        gap_hi = max(gap_lo, self._parse_float_env("BACK_TO_BACK_GAP_MAX_S", default=5.0, minimum=0.0))
-        if back_to_back:
-            debug_print(self.cfg.debug, f"BACK_TO_BACK=1: next session starts {gap_lo:.0f}-{gap_hi:.0f}s after a slot frees (max {self.cfg.max_concurrency} at once)")
+    async def _schedule_loop(self, pw, shared_browser):
+        c = self.cfg
+        interval = 60.0 / c.sessions_per_minute
+        if c.back_to_back:
+            self.log(f"BACK_TO_BACK=1: next session starts {c.gap_min_s:.0f}-{c.gap_max_s:.0f}s "
+                     f"after a slot frees (max {c.max_concurrency} at once)")
         else:
-            debug_print(self.cfg.debug, f"Start interval ≈ {interval:.2f}s (jitter ±{jitter:.0%}) for {self.cfg.sessions_per_minute} sessions/min")
-        started_total = 0
+            self.log(f"Start interval ≈ {interval:.0f}s (jitter ±{c.jitter:.0%}), "
+                     f"max {c.max_concurrency} at once")
+        tasks = set()
+        first = True
         while not self.stop_event.is_set():
-            if self.restart_event.is_set():
-                debug_print(self.cfg.debug, "Restart requested; pausing scheduling")
-                break
-            if self.cfg.kill_switch_file:
-                try:
-                    if os.path.exists(self.cfg.kill_switch_file):
-                        debug_print(self.cfg.debug, "Kill switch present; draining…")
-                        break
-                except Exception:
-                    pass
-            if self.smoke_limit is not None and started_total >= self.smoke_limit:
-                break
-            if self._scheduler_circuit_active():
-                await asyncio.sleep(min(interval, 1.0))
-                continue
-            if back_to_back:
-                await self.sem.acquire()  # blocks until the previous session ends
-                if self.stop_event.is_set() or self.restart_event.is_set():
+            if c.back_to_back:
+                await self.sem.acquire()  # waits for the previous session to end
+                wait = random.uniform(1.0, 3.0) if first else random.uniform(c.gap_min_s, c.gap_max_s)
+                if self.consecutive_errors:
+                    wait = max(wait, min(300.0, 10.0 * 2 ** (self.consecutive_errors - 1)))
+                    self.log(f"{self.consecutive_errors} session error(s) in a row; waiting {wait:.0f}s")
+                if await self._sleep_or_stop(wait):
                     self.sem.release()
                     break
-                await asyncio.sleep(random.uniform(gap_lo, gap_hi) if started_total else random.uniform(1.0, 3.0))
             else:
-                if start_now and started_total == 0:
-                    debug_print(self.cfg.debug, "SCHEDULER_START_IMMEDIATELY=1: first session now")
-                    await asyncio.sleep(random.uniform(1.0, 3.0))
-                else:
-                    await asyncio.sleep(interval * random.uniform(1.0 - jitter, 1.0 + jitter))
-                if self.stop_event.is_set() or self.restart_event.is_set():
+                wait = random.uniform(1.0, 3.0) if first else interval * random.uniform(1 - c.jitter, 1 + c.jitter)
+                if await self._sleep_or_stop(wait):
                     break
                 await self.sem.acquire()
+            first = False
             self.session_counter += 1
-            started_total += 1
-            self.metrics["started"] += 1
-            if self.metrics["started"] % 25 == 0:
-                self._log_metrics_snapshot("trafficgen metrics")
-            asyncio.create_task(
-                self._run_session(self.session_counter, browser, pw, device_pool),
-                name=f"session-{self.session_counter}",
-            )
-        while self.sem._value < self.cfg.max_concurrency:
-            await asyncio.sleep(0.5)
-        self._log_metrics_snapshot("drain complete")
+            t = asyncio.create_task(self._run_session(self.session_counter, pw, shared_browser))
+            tasks.add(t)
+            t.add_done_callback(tasks.discard)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-    def _choose_referrer_for_session(self) -> Optional[str]:
-        items = self.cfg.referrers or []
-        if not items:
-            return None
-        picked = _weighted_pick(items, key="weight") or {}
-        src = (picked.get("source") or "").strip()
-        if not src or src.lower() == "direct":
-            return None
-        return src
-
-    async def _run_session(self, sid: int, browser, pw, device_pool):
-        success = False
-        timed_out = False
-        record_metrics = True
-        # BROWSER_PER_SESSION=1: launch a brand-new Chromium process for this
-        # session and close it afterwards, instead of a new context in the
-        # shared browser. The scheduler loop is untouched, so cadence holds.
-        own_browser = None
+    async def _run_session(self, sid: int, pw, shared_browser):
+        own = None
         try:
-            if os.getenv("BROWSER_PER_SESSION", "0") == "1":
-                own_browser = await self._launch_browser(pw)
-                browser = own_browser
-                debug_print(self.cfg.debug, f"[S{sid}] fresh Chromium process for this session")
-            dev = pick_device(device_pool, pw)
-            _is_desktop = not bool(dev["context_args"].get("is_mobile", False))
-            _session_timeout = self._session_timeout * (
-                self._desktop_session_mult if _is_desktop else self._mobile_session_mult
-            )
-            import random as _random
-            locale = _random.choice(self.cfg.locales or ["en-US"])
-            tz = _random.choice(self.cfg.timezones or ["America/Toronto"])
-            persona = attribution.choose_persona(self.personas) if self.personas else None
-            ref = self._choose_referrer_for_session() if persona is None else None
-            s = Session(
-                session_id=sid,
-                browser=browser,
-                playwright=pw,
-                origin=self.cfg.origin,
-                allowlist_roots=self.cfg.allowlist_roots,
-                device_context_args=dev["context_args"],
-                locale=locale,
-                timezone_id=tz,
-                allow_checkout=self.cfg.allow_checkout,
-                checkout_complete_rate=self.cfg.checkout_complete_rate,
-                flows=self.cfg.flows,
-                think_cfg=self.cfg.think_times,
-                global_qps=self.global_qps,
-                debug=self.cfg.debug,
-                fault_profile={"slow_request_fraction": 0.03},
-                referrer_url=ref,
-                persona=persona,
-                may_place_order=self.order_limiter.may_place_order,
-            )
-            try:
-                await asyncio.wait_for(s.run(), timeout=_session_timeout)
-                success = True
-            except asyncio.TimeoutError:
-                timed_out = True
-                debug_print(
-                    self.cfg.debug,
-                    f"[session {sid}] timed out after {_session_timeout:.1f}s",
-                )
-        except asyncio.CancelledError:
-            record_metrics = False
-            raise
+            browser = shared_browser
+            if browser is None:
+                own = browser = await self._launch(pw)
+                self.log(f"[S{sid}] fresh Chromium process for this session")
+            s = Session(sid, browser, self.cfg.origin, debug=self.cfg.debug)
+            await asyncio.wait_for(s.run(), timeout=self.cfg.session_max_seconds)
+            self.consecutive_errors = 0
+        except asyncio.TimeoutError:
+            self.log(f"[S{sid}] timed out after {self.cfg.session_max_seconds:.0f}s")
         except Exception as e:
-            debug_print(self.cfg.debug, f"[session {sid}] error: {e}")
+            self.consecutive_errors += 1
+            self.log(f"[S{sid}] error: {type(e).__name__}: {str(e).splitlines()[0]}")
         finally:
-            if own_browser is not None:
+            if own is not None:
                 with contextlib.suppress(Exception):
-                    await own_browser.close()
-            if record_metrics:
-                self._register_session_result(success, timed_out)
+                    await own.close()
             self.sem.release()
-
-    async def _graceful_stop(self, sig):
-        debug_print(self.cfg.debug, f"Signal {sig} received: draining…")
-        self.stop_event.set()

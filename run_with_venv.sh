@@ -4,7 +4,7 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 # noibu-traffic-gen runner
 # Creates/uses venv .venv, installs dependencies and Playwright browsers,
-# then runs the new Chromium-only traffic generator with .env support.
+# then runs the ab-test traffic generator with .env support.
 # -----------------------------------------------------------------------------
 
 PYBIN="${PYTHON:-python3}"
@@ -22,8 +22,7 @@ source .venv/bin/activate
 
 echo ">> Upgrading pip and installing deps…"
 python -m pip install --upgrade pip
-python -m pip install playwright==1.48.0 typer==0.12.5 pydantic==2.8.2 PyYAML==6.0.2 \
-    python-dotenv==1.0.1 tenacity==8.5.0
+python -m pip install playwright==1.48.0 python-dotenv==1.0.1
 
 echo ">> Installing Playwright Chromium browser…"
 python -m playwright install chromium
