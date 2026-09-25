@@ -18,8 +18,10 @@ Drives synthetic shoppers into the cart-page checkout A/B test on
      → clicks it and completes checkout with the test card in `.env`.
    - **Primary button only** (`a[data-primary-checkout-now-action]`) → ends the session.
 
-Every session runs desktop Chrome at 1920×1080 in a fresh browser (the banner
-only renders at ≥801px).
+Every session runs desktop at 1920×1080 (the banner only renders at ≥801px)
+in a fresh browser process, rotating Chromium → Firefox → WebKit per session
+(`BROWSER_TYPES`), each with a matching user agent and `navigator.webdriver`
+reported as `false`.
 
 ## Run
 
@@ -36,13 +38,16 @@ again forces exit.
 Per session:
 
 ```
-[DEBUG] [S12] landing: source=google referer=https://www.google.com/ | https://noibudemo.com/?utm_source=google&utm_medium=organic&utm_campaign=trafficgen
+[DEBUG] [S12] landing (firefox): source=google referer=https://www.google.com/ | https://noibudemo.com/?utm_source=google&utm_medium=organic&utm_campaign=trafficgen
 [DEBUG] [S12] ab: added 1/2 ← https://noibudemo.com/dustpan-brush/
-[DEBUG] [S12] ab result: variant=control items=2 primary_button=yes flag_sdk=no flag=no-sdk vw=1920 -> exit
+[DEBUG] [S12] ab result: variant=control engine=firefox items=2 primary_button=yes flag_sdk=no flag=no-sdk cfg_ff_key=no collect_ff_js=no webdriver=False vw=1920 -> exit
 ```
 
 `flag_sdk` / `flag` show whether `window.NoibuFeatureFlag` loaded and what it
 returned — the theme falls back to control when the SDK is missing.
+`cfg_ff_key` / `collect_ff_js` show why: Noibu's `collect-core.js` only loads
+the flag SDK (`collect-ff.js`) when its embedded `NOIBUJS_CONFIG` contains a
+`feature_flag_key`. The summary also splits control/sticky by browser.
 
 Every `AB_SUMMARY_EVERY` sessions (or `AB_SUMMARY_MINUTES`), and on exit:
 
@@ -62,7 +67,8 @@ Every `AB_SUMMARY_EVERY` sessions (or `AB_SUMMARY_MINUTES`), and on exit:
 | `MAX_CONCURRENCY` | `1` | Sessions running at once |
 | `SESSION_MAX_SECONDS` | `600` | Kill a stuck session after this long |
 | `HEADLESS` | `1` | 0 shows the browser window |
-| `BROWSER_PER_SESSION` | `1` | 1 = new Chromium process per session; 0 = shared browser, fresh context per session |
+| `BROWSER_PER_SESSION` | `1` | 1 = new browser process per session; 0 = shared browser per engine, fresh context per session |
+| `BROWSER_TYPES` | `chromium,firefox,webkit` | Engines rotated one per session |
 | `POST_NAV_SETTLE_MIN_MS` / `MAX_MS` | `2500` / `5000` | Pause after each page load |
 | `AB_TEST_PRODUCTS_MIN` / `MAX` | `1` / `3` | Products added per session |
 | `AB_TEST_STICKY_WAIT_MS` | `6000` | How long to wait for the sticky banner before counting control |
@@ -82,7 +88,7 @@ noibu-traffic-gen.py     entry point (loads .env)
 trafficgen/runner.py     scheduling, browser launch, timeouts
 trafficgen/session.py    one shopper session + [AB SUMMARY] tally
 trafficgen/checkout.py   BigCommerce card checkout (email → shipping → payment → place order)
-trafficgen/devices.py    desktop Chrome 1920×1080 profile
+trafficgen/devices.py    desktop 1920×1080 profiles for Chromium / Firefox / WebKit
 trafficgen/utils.py      small helpers
 run_with_venv.sh         creates .venv, installs deps + Chromium, runs
 ```

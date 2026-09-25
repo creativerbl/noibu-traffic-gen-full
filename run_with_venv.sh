@@ -25,7 +25,7 @@ python -m pip install --upgrade pip
 python -m pip install playwright==1.48.0 python-dotenv==1.0.1
 
 echo ">> Installing Playwright Chromium browser…"
-python -m playwright install chromium
+python -m playwright install chromium firefox webkit
 
 echo ">> Running noibu-traffic-gen.py …"
 export PYTHONUNBUFFERED=1

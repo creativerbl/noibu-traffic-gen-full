@@ -16,7 +16,7 @@ from typing import List, Optional
 from urllib.parse import urlencode
 
 from trafficgen import checkout as checkout_engine
-from trafficgen.devices import desktop_context_args
+from trafficgen.devices import context_args
 from trafficgen.utils import debug_print, think, weighted_choice
 
 NAV_TIMEOUT_MS = 25_000
@@ -73,6 +73,7 @@ class _ABTally:
     def __init__(self):
         self.started = 0
         self.counts = {k: 0 for k in self.OUTCOMES}
+        self.by_engine = {}  # engine -> [control, sticky]
         self.t0 = time.time()
         self.last_print = self.t0
         self.every = max(1, int(os.getenv("AB_SUMMARY_EVERY", "5")))
@@ -82,8 +83,11 @@ class _ABTally:
     def start(self):
         self.started += 1
 
-    def record(self, outcome: str):
+    def record(self, outcome: str, engine: str = ""):
         self.counts[outcome] += 1
+        if engine and (outcome == "control" or outcome.startswith("sticky")):
+            row = self.by_engine.setdefault(engine, [0, 0])
+            row[0 if outcome == "control" else 1] += 1
         finished = sum(self.counts.values())
         if finished % self.every == 0 or (time.time() - self.last_print) >= self.minutes * 60:
             self.print_summary()
@@ -105,6 +109,9 @@ class _ABTally:
             f"{c['sticky_order_failed']} | checkout didn't load {c['sticky_no_checkout']}",
             f"  no variant    : never reached cart {c['no_cart']} | nothing added "
             f"{c['no_items']} | unfinished/timed out {self.started - finished}",
+            "  by browser    : " + (" | ".join(
+                f"{e} control {v[0]} / sticky {v[1]}" for e, v in sorted(self.by_engine.items()))
+                or "-"),
         ]), flush=True)
         self.last_print = time.time()
 
@@ -126,9 +133,10 @@ class Session:
     PRIMARY_SEL = "a[data-primary-checkout-now-action]"
     FLAG_KEY = "3393-desktop-cart-sticky-checkout-cta"
 
-    def __init__(self, session_id: int, browser, origin: str, debug: bool = True):
+    def __init__(self, session_id: int, browser, engine: str, origin: str, debug: bool = True):
         self.id = session_id
         self.browser = browser
+        self.engine = engine
         self.origin = origin.rstrip("/")
         self.debug = debug
         self.context = None
@@ -156,7 +164,7 @@ class Session:
 
     async def run(self):
         self.context = await self.browser.new_context(
-            **desktop_context_args(),
+            **context_args(self.engine),
             locale=self.locale,
             timezone_id=self.timezone,
             ignore_https_errors=True,
@@ -166,6 +174,10 @@ class Session:
             extra_http_headers={"Cache-Control": "no-cache, no-store, must-revalidate",
                                 "Pragma": "no-cache"},
         )
+        # Automation flag: Playwright sets navigator.webdriver=true in every
+        # engine; a real shopper's browser reports false.
+        await self.context.add_init_script(
+            "Object.defineProperty(Navigator.prototype, 'webdriver', {get: () => false});")
         self.page = await self.context.new_page()
         try:
             await self._land()
@@ -195,7 +207,7 @@ class Session:
             medium = _kv("REFERRER_UTM_MEDIUMS").get(source, os.getenv("UTM_MEDIUM_DEFAULT", "referral"))
             url += "?" + urlencode({"utm_source": source, "utm_medium": medium,
                                     "utm_campaign": os.getenv("UTM_CAMPAIGN_DEFAULT", "trafficgen")})
-        self.log(f"landing: source={source} referer={referer or 'none'} | {url}")
+        self.log(f"landing ({self.engine}): source={source} referer={referer or 'none'} | {url}")
         await self._goto(url, referer=referer)
         await self._scroll_a_bit()
 
@@ -307,7 +319,14 @@ class Session:
                 let v = 'no-sdk';
                 try { if (ff) v = ff.getClient().getStringValue(key, 'original'); }
                 catch (e) { v = 'error: ' + e; }
-                return { sdk: !!ff, flag: v, vw: innerWidth };
+                // collect-core.js only loads the flag SDK (collect-ff.js) when
+                // its embedded NOIBUJS_CONFIG has a feature_flag_key.
+                const cfg = window.NOIBUJS_CONFIG || {};
+                const ffJs = performance.getEntriesByType('resource')
+                    .some(e => e.name.includes('collect-ff'));
+                return { sdk: !!ff, flag: v, vw: innerWidth,
+                         cfgKey: !!cfg.feature_flag_key, ffJs,
+                         webdriver: navigator.webdriver };
             }""", self.FLAG_KEY)
         return {}
 
@@ -343,11 +362,13 @@ class Session:
             primary = await self.page.locator(self.PRIMARY_SEL).first.is_visible()
             diag = await self._flag_diagnostics()
             self.log(
-                f"ab result: variant=control items={added} "
+                f"ab result: variant=control engine={self.engine} items={added} "
                 f"primary_button={'yes' if primary else 'no'} "
                 f"flag_sdk={'yes' if diag.get('sdk') else 'no'} flag={diag.get('flag')} "
-                f"vw={diag.get('vw')} -> exit")
-            AB_TALLY.record("control")
+                f"cfg_ff_key={'yes' if diag.get('cfgKey') else 'no'} "
+                f"collect_ff_js={'yes' if diag.get('ffJs') else 'no'} "
+                f"webdriver={diag.get('webdriver')} vw={diag.get('vw')} -> exit")
+            AB_TALLY.record("control", self.engine)
             return
 
         self.log("ab: sticky checkout banner visible -> checkout")
@@ -357,10 +378,10 @@ class Session:
             await self.page.wait_for_url("**/checkout**", timeout=30_000)
         except Exception:
             await self._log_page("did not reach checkout after sticky click")
-            AB_TALLY.record("sticky_no_checkout")
+            AB_TALLY.record("sticky_no_checkout", self.engine)
             return
         ok = await checkout_engine.complete_checkout(
             self.page, checkout_engine.random_identity(),
             checkout_engine.default_card(), debug=self.debug)
-        self.log(f"ab result: variant=sticky items={added} order_placed={ok}")
-        AB_TALLY.record("sticky_ordered" if ok else "sticky_order_failed")
+        self.log(f"ab result: variant=sticky engine={self.engine} items={added} order_placed={ok}")
+        AB_TALLY.record("sticky_ordered" if ok else "sticky_order_failed", self.engine)

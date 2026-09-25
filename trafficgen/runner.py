@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from playwright.async_api import async_playwright
 
+from trafficgen.devices import ENGINES
 from trafficgen.session import Session
 from trafficgen.utils import debug_print
 
@@ -32,6 +33,7 @@ class RunnerConfig:
     max_concurrency: int
     session_max_seconds: float
     browser_per_session: bool
+    browser_types: tuple
     back_to_back: bool
     gap_min_s: float
     gap_max_s: float
@@ -48,6 +50,10 @@ class RunnerConfig:
             max_concurrency=max(1, int(_f("MAX_CONCURRENCY", 1, 1))),
             session_max_seconds=_f("SESSION_MAX_SECONDS", 600, 30),
             browser_per_session=os.getenv("BROWSER_PER_SESSION", "1") == "1",
+            browser_types=tuple(
+                b for b in (x.strip().lower() for x in os.getenv("BROWSER_TYPES", ",".join(ENGINES)).split(","))
+                if b in ENGINES
+            ) or ("chromium",),
             back_to_back=os.getenv("BACK_TO_BACK", "1") == "1",
             gap_min_s=gap_min,
             gap_max_s=max(gap_min, _f("BACK_TO_BACK_GAP_MAX_S", 5.0)),
@@ -64,17 +70,29 @@ class Runner:
         self.stop_event: asyncio.Event = None
         self.sem: asyncio.Semaphore = None
         self.session_counter = 0
+        self._engine_offset = random.randrange(len(cfg.browser_types))
+        self._shared = {}  # engine -> browser, when BROWSER_PER_SESSION=0
         self.consecutive_errors = 0  # back-off so a broken setup can't spin
 
     def log(self, msg: str):
         debug_print(self.cfg.debug, msg)
 
-    async def _launch(self, pw):
-        return await pw.chromium.launch(
-            headless=self.cfg.headless,
-            args=["--disable-cache", "--disable-application-cache",
-                  "--disk-cache-size=0", "--aggressive-cache-discard"],
-        )
+    def _engine_for(self, sid: int) -> str:
+        """Rotate through BROWSER_TYPES so consecutive sessions use a
+        different engine (random starting point per run)."""
+        types = self.cfg.browser_types
+        return types[(sid - 1 + self._engine_offset) % len(types)]
+
+    async def _launch(self, pw, engine: str):
+        kind = getattr(pw, engine)
+        if engine == "chromium":
+            return await kind.launch(
+                headless=self.cfg.headless,
+                args=["--disable-cache", "--disable-application-cache",
+                      "--disk-cache-size=0", "--aggressive-cache-discard",
+                      "--disable-blink-features=AutomationControlled"],
+            )
+        return await kind.launch(headless=self.cfg.headless)
 
     async def run(self):
         self.stop_event = asyncio.Event()
@@ -83,13 +101,14 @@ class Runner:
         for s in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(s, self._request_stop)
         async with async_playwright() as pw:
-            shared = None if self.cfg.browser_per_session else await self._launch(pw)
+            self.log(f"Browsers: {', '.join(self.cfg.browser_types)} "
+                     f"({'new process per session' if self.cfg.browser_per_session else 'shared, new context per session'})")
             try:
-                await self._schedule_loop(pw, shared)
+                await self._schedule_loop(pw)
             finally:
-                if shared is not None:
+                for b in self._shared.values():
                     with contextlib.suppress(Exception):
-                        await shared.close()
+                        await b.close()
 
     def _request_stop(self):
         if not self.stop_event.is_set():
@@ -109,7 +128,7 @@ class Runner:
         except asyncio.TimeoutError:
             return False
 
-    async def _schedule_loop(self, pw, shared_browser):
+    async def _schedule_loop(self, pw):
         c = self.cfg
         interval = 60.0 / c.sessions_per_minute
         if c.back_to_back:
@@ -137,27 +156,31 @@ class Runner:
                 await self.sem.acquire()
             first = False
             self.session_counter += 1
-            t = asyncio.create_task(self._run_session(self.session_counter, pw, shared_browser))
+            t = asyncio.create_task(self._run_session(self.session_counter, pw))
             tasks.add(t)
             t.add_done_callback(tasks.discard)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _run_session(self, sid: int, pw, shared_browser):
+    async def _run_session(self, sid: int, pw):
         own = None
+        engine = self._engine_for(sid)
         try:
-            browser = shared_browser
-            if browser is None:
-                own = browser = await self._launch(pw)
-                self.log(f"[S{sid}] fresh Chromium process for this session")
-            s = Session(sid, browser, self.cfg.origin, debug=self.cfg.debug)
+            if self.cfg.browser_per_session:
+                own = browser = await self._launch(pw, engine)
+                self.log(f"[S{sid}] fresh {engine} process for this session")
+            else:
+                browser = self._shared.get(engine)
+                if browser is None or not browser.is_connected():
+                    browser = self._shared[engine] = await self._launch(pw, engine)
+            s = Session(sid, browser, engine, self.cfg.origin, debug=self.cfg.debug)
             await asyncio.wait_for(s.run(), timeout=self.cfg.session_max_seconds)
             self.consecutive_errors = 0
         except asyncio.TimeoutError:
             self.log(f"[S{sid}] timed out after {self.cfg.session_max_seconds:.0f}s")
         except Exception as e:
             self.consecutive_errors += 1
-            self.log(f"[S{sid}] error: {type(e).__name__}: {str(e).splitlines()[0]}")
+            self.log(f"[S{sid}] {engine} error: {type(e).__name__}: {str(e).splitlines()[0]}")
         finally:
             if own is not None:
                 with contextlib.suppress(Exception):
